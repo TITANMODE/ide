@@ -6,6 +6,178 @@ import time
 import threading
 import math
 import random
+import sys
+from functools import cmp_to_key
+
+#######################
+# Extra Math Functions
+#######################
+def clamp(x, mn, mx):
+    return max(mn, min(x, mx))
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+def map_value(x, inmin, inmax, outmin, outmax):
+    return (x - inmin) / (inmax - inmin) * (outmax - inmin) + outmin
+
+def sign(x):
+    return -1 if x < 0 else (1 if x > 0 else 0)
+
+import math
+import random
+
+# Gradient vectors
+gradients = [(1,1,0), (-1,1,0), (1,-1,0), (-1,-1,0),
+             (1,0,1), (-1,0,1), (1,0,-1), (-1,0,-1),
+             (0,1,1), (0,-1,1), (0,1,-1), (0,-1,-1)]
+
+# Permutation table (repeated to avoid overflow)
+p = [i for i in range(256)]
+random.shuffle(p)
+p = p * 2
+
+def fade(t):
+    """Fade function to smooth the interpolation."""
+    return t * t * t * (t * (t * 6 - 15) + 10)
+
+
+
+def grad(hash, x, y, z):
+    """Calculates the gradient vector dot product."""
+    g = gradients[hash % 12]
+    return g[0] * x + g[1] * y + g[2] * z
+
+def noise(x, y, z):
+    """Generates Perlin noise for the given x, y, z coordinates."""
+    # Determine unit cube containing the point
+    X = int(math.floor(x)) & 255
+    Y = int(math.floor(y)) & 255
+    Z = int(math.floor(z)) & 255
+
+    # Find relative x, y, z of the point in the cube
+    x -= math.floor(x)
+    y -= math.floor(y)
+    z -= math.floor(z)
+
+    # Compute fade curves for each of x, y, z
+    u = fade(x)
+    v = fade(y)
+    w = fade(z)
+
+    # Hash coordinates of the cube corners
+    A  = p[X] + Y
+    AA = p[A] + Z
+    AB = p[A + 1] + Z
+    B  = p[X + 1] + Y
+    BA = p[B] + Z
+    BB = p[B + 1] + Z
+
+    # Add blended results from the corners of the cube
+    return lerp(w,
+        lerp(v,
+            lerp(u, grad(p[AA], x, y, z), grad(p[BA], x - 1, y, z)),
+            lerp(u, grad(p[AB], x, y - 1, z), grad(p[BB], x - 1, y - 1, z))
+        ),
+        lerp(v,
+            lerp(u, grad(p[AA + 1], x, y, z - 1), grad(p[BA + 1], x - 1, y, z - 1)),
+            lerp(u, grad(p[AB + 1], x, y - 1, z - 1), grad(p[BB + 1], x - 1, y - 1, z - 1))
+        )
+    )
+
+def cbrt(x):
+    # Cube root function.
+    return x ** (1 / 3) if x >= 0 else -((-x) ** (1 / 3))
+
+#######################
+# Task Library Functions
+#######################
+from types import FunctionType
+
+def task_spawn(func, *args):
+    def wrapper():
+        if hasattr(func, '__class__') and func.__class__.__name__ == "UserFunction":
+            interpreter = _game_state.get('interpreter')
+            if interpreter is None:
+                raise Exception("No interpreter available for task.spawn for UserFunction")
+            interpreter.call_function(func, *args)
+        else:
+            func(*args)
+    t = threading.Thread(target=wrapper)
+    t.start()
+    return t
+
+def task_defer(func, *args):
+    def wrapper():
+        if hasattr(func, '__class__') and func.__class__.__name__ == "UserFunction":
+            interpreter = _game_state.get('interpreter')
+            if interpreter is None:
+                raise Exception("No interpreter available for task.defer for UserFunction")
+            interpreter.call_function(func, *args)
+        else:
+            func(*args)
+    t = threading.Timer(0, wrapper)
+    t.start()
+    return t
+
+def task_delay(duration, func, *args):
+    def wrapper():
+        if hasattr(func, '__class__') and func.__class__.__name__ == "UserFunction":
+            interpreter = _game_state.get('interpreter')
+            if interpreter is None:
+                raise Exception("No interpreter available for task.delay for UserFunction")
+            interpreter.call_function(func, *args)
+        else:
+            func(*args)
+    t = threading.Timer(duration, wrapper)
+    t.start()
+    return t
+
+def task_desynchronize():
+    # No-op in this simple interpreter.
+    pass
+
+def task_synchronize():
+    # No-op in this simple interpreter.
+    pass
+
+def task_wait(duration):
+    time.sleep(duration)
+    return duration
+
+def task_cancel(thread):
+    if hasattr(thread, 'cancel'):
+        thread.cancel()
+
+#######################
+# OS Library Functions
+#######################
+def os_clock():
+    return time.perf_counter()
+
+def os_date(fmt, t=None):
+    if t is None:
+        t = time.time()
+    return time.strftime(fmt, time.localtime(t))
+
+def os_difftime(t2, t1):
+    return t2 - t1
+
+def os_time(tbl=None):
+    return time.time()
+
+#######################
+# Built-in ipairs function
+#######################
+def builtin_ipairs(tbl):
+    if not isinstance(tbl, dict):
+        raise Exception("ipairs expects a table")
+    result = []
+    i = 1
+    while i in tbl:
+        result.append((i, tbl[i]))
+        i += 1
+    return result
 
 #######################
 # Lexer
@@ -17,7 +189,6 @@ TT_KEYWORD = 'KEYWORD'
 TT_OP = 'OP'
 TT_EOF = 'EOF'
 
-# Keywords (added "nil", "repeat", "until", and "elseif")
 KEYWORDS = {
     'if', 'then', 'else', 'elseif', 'end', 'while', 'do', 'print',
     'local', 'true', 'false', 'for', 'in', 'and', 'or', 'not',
@@ -63,7 +234,6 @@ class Lexer:
             self.advance()
 
     def skip_comment(self):
-        # Skip until end of line (only supports '--' comments as in Lua)
         while self.current_char is not None and self.current_char != "\n":
             self.advance()
 
@@ -77,13 +247,13 @@ class Lexer:
     def string(self):
         str_val = ''
         quote = self.current_char
-        self.advance()  # skip opening quote
+        self.advance()
         while self.current_char is not None and self.current_char != quote:
             str_val += self.current_char
             self.advance()
         if self.current_char != quote:
             self.error("Unterminated string literal")
-        self.advance()  # skip closing quote
+        self.advance()
         return Token(TT_STRING, str_val, self.line)
 
     def identifier(self):
@@ -97,7 +267,6 @@ class Lexer:
 
     def get_next_token(self):
         while self.current_char is not None:
-            # Comments starting with '--'
             if self.current_char == '-' and self.peek() == '-':
                 self.advance(); self.advance()
                 self.skip_comment()
@@ -114,7 +283,6 @@ class Lexer:
                 return self.string()
             if self.current_char.isalpha() or self.current_char == '_':
                 return self.identifier()
-            # Multi-character operators:
             if self.current_char == '~' and self.peek() == '=':
                 self.advance(); self.advance()
                 return Token(TT_OP, '~=', self.line)
@@ -133,7 +301,10 @@ class Lexer:
             if self.current_char == '.' and self.peek() == '.':
                 self.advance(); self.advance()
                 return Token(TT_OP, '..', self.line)
-            # Added support for ':' along with '[' , ']', '#' (as length operator) and '-' as operator.
+            if self.current_char in "+-" and self.peek() == "=":
+                op = self.current_char + "="
+                self.advance(); self.advance()
+                return Token(TT_OP, op, self.line)
             if self.current_char in "+-*/=(),<>{}.%^#[]:":
                 ch = self.current_char
                 self.advance()
@@ -168,32 +339,27 @@ class Boolean(AST):
     def __init__(self, value):
         self.value = True if value == 'true' else False
 
-# New AST node for nil literal
 class Nil(AST):
     def __init__(self):
         pass
     def __repr__(self):
         return "Nil"
 
-# New AST node for repeat-until loop
 class RepeatUntil(AST):
     def __init__(self, block, condition):
-        self.block = block  # list of statements
+        self.block = block
         self.condition = condition
 
-# New AST node for table indexing using square brackets
 class TableIndex(AST):
     def __init__(self, table_expr, index_expr):
         self.table_expr = table_expr
         self.index_expr = index_expr
 
-# New AST node for unary operators (such as '-' and '#' for length)
 class UnaryOp(AST):
     def __init__(self, op, expr):
-        self.op = op  # token containing operator
+        self.op = op
         self.expr = expr
 
-# ForIn now holds a list of variables.
 class Var(AST):
     def __init__(self, name, line=None):
         self.name = name
@@ -201,7 +367,7 @@ class Var(AST):
 
 class TableLiteral(AST):
     def __init__(self, entries):
-        self.entries = entries  # list of (key, value) pairs
+        self.entries = entries
 
 class TableAccess(AST):
     def __init__(self, table_expr, field):
@@ -215,14 +381,11 @@ class Not(AST):
 class BinOp(AST):
     def __init__(self, left, op, right):
         self.left = left
-        self.op = op  # Token
+        self.op = op
         self.right = right
 
-# Modified Assignment to allow multiple variables on LHS and multiple expressions on RHS.
 class Assignment(AST):
     def __init__(self, left, expr, local=False):
-        # left: list of Var, TableAccess, or TableIndex nodes
-        # expr: list of expression nodes
         self.left = left
         self.expr = expr
         self.local = local
@@ -231,22 +394,20 @@ class Print(AST):
     def __init__(self, expr):
         self.expr = expr
 
-# Modified If node; elseif clauses are built as nested If nodes.
 class If(AST):
     def __init__(self, cond, then_block, else_block=None):
         self.cond = cond
-        self.then_block = then_block  # list of statements
-        self.else_block = else_block  # list of statements or nested If
+        self.then_block = then_block
+        self.else_block = else_block
 
 class While(AST):
     def __init__(self, cond, body):
         self.cond = cond
         self.body = body
 
-# For-in loop supports multiple variables.
 class ForIn(AST):
     def __init__(self, vars, expr, block):
-        self.vars = vars  # list of Var
+        self.vars = vars
         self.expr = expr
         self.block = block
 
@@ -327,7 +488,11 @@ class Parser:
     def statement(self):
         if self.current_token.type == TT_KEYWORD:
             if self.current_token.value == 'local':
-                return self.local_assignment()
+                # Support local function definitions: if next token is 'function', call local_function_def
+                if self.tokens[self.pos+1].type == TT_KEYWORD and self.tokens[self.pos+1].value == 'function':
+                    return self.local_function_def()
+                else:
+                    return self.local_assignment()
             elif self.current_token.value == 'if':
                 return self.if_statement()
             elif self.current_token.value == 'while':
@@ -355,13 +520,37 @@ class Parser:
         if self.current_token.type == TT_IDENT or (self.current_token.type == TT_OP and self.current_token.value in ('{', '[')):
             start_pos = self.pos
             expr_node = self.expr()
-            if self.current_token.type == TT_OP and self.current_token.value == '=':
+            if self.current_token.type == TT_OP and self.current_token.value in ('=', '+=', '-='):
                 self.pos = start_pos
                 self.current_token = self.tokens[self.pos]
                 return self.assignment()
             else:
                 return expr_node
         self.error(f"Unexpected token: {self.current_token}")
+
+    def local_function_def(self):
+        # Parse "local function function_name(...)" syntax
+        self.eat(TT_KEYWORD, 'local')
+        self.eat(TT_KEYWORD, 'function')
+        if self.current_token.type == TT_IDENT:
+            name = self.current_token.value
+            self.eat(TT_IDENT)
+            self.eat(TT_OP, '(')
+            params = []
+            if not (self.current_token.type == TT_OP and self.current_token.value == ')'):
+                params.append(self.current_token.value)
+                self.eat(TT_IDENT)
+                while self.current_token.type == TT_OP and self.current_token.value == ',':
+                    self.eat(TT_OP, ',')
+                    params.append(self.current_token.value)
+                    self.eat(TT_IDENT)
+            self.eat(TT_OP, ')')
+            body = self.statement_list()
+            self.eat(TT_KEYWORD, 'end')
+            # Return a local assignment with a function literal.
+            return Assignment([Var(name)], [FunctionLiteral(params, Block(body))], local=True)
+        else:
+            self.error("Expected function name after 'local function'")
 
     def for_statement(self):
         self.eat(TT_KEYWORD, 'for')
@@ -398,7 +587,6 @@ class Parser:
         self.eat(TT_KEYWORD, 'end')
         return ForNumeric(Var(var_name), start_expr, end_expr, step_expr, block)
 
-    # New helper: parse a comma-separated list of variables
     def varlist(self):
         vars = [self.postfix_expr()]
         while self.current_token.type == TT_OP and self.current_token.value == ',':
@@ -406,7 +594,6 @@ class Parser:
             vars.append(self.postfix_expr())
         return vars
 
-    # New helper: parse a comma-separated list of expressions
     def explist(self):
         exps = [self.expr()]
         while self.current_token.type == TT_OP and self.current_token.value == ',':
@@ -423,9 +610,21 @@ class Parser:
 
     def assignment(self):
         left = self.varlist()
-        self.eat(TT_OP, '=')
-        expr = self.explist()
-        return Assignment(left, expr, local=False)
+        if self.current_token.type == TT_OP and self.current_token.value in ("=", "+=", "-="):
+            op = self.current_token.value
+            self.advance()
+            if op == "=":
+                expr = self.explist()
+                return Assignment(left, expr, local=False)
+            else:
+                if len(left) != 1:
+                    self.error("Compound assignment only supports single variable assignment")
+                right_expr = self.expr()
+                compound_op = op[0]
+                new_expr = BinOp(left[0], Token(TT_OP, compound_op, left[0].line), right_expr)
+                return Assignment(left, [new_expr], local=False)
+        else:
+            self.error("Expected assignment operator")
 
     def print_statement(self):
         self.eat(TT_KEYWORD, 'print')
@@ -481,7 +680,6 @@ class Parser:
         if self.current_token.type == TT_IDENT:
             name = self.current_token.value
             self.eat(TT_IDENT)
-            # Check for method definition (using ':' or '.')
             if self.current_token.type == TT_OP and self.current_token.value in ('.', ':'):
                 op = self.current_token.value
                 self.eat(TT_OP, op)
@@ -490,7 +688,6 @@ class Parser:
                 self.eat(TT_OP, '(')
                 params = []
                 if op == ':':
-                    # Colon syntax automatically adds 'self' as first parameter
                     params.append("self")
                 if not (self.current_token.type == TT_OP and self.current_token.value == ')'):
                     params.append(self.current_token.value)
@@ -625,7 +822,7 @@ class Parser:
         if self.current_token.type == TT_OP and self.current_token.value == '^':
             op = self.current_token
             self.eat(TT_OP, '^')
-            right = self.unary_expr()  # right-associative
+            right = self.unary_expr()
             node = BinOp(node, op, right)
         return node
 
@@ -648,7 +845,6 @@ class Parser:
                 self.eat(TT_IDENT)
                 node = TableAccess(node, field)
             elif self.current_token.type == TT_OP and self.current_token.value == ':':
-                # Handle method call: table:method(args) becomes table.method(table, args)
                 self.eat(TT_OP, ':')
                 field = self.current_token.value
                 self.eat(TT_IDENT)
@@ -750,6 +946,10 @@ def static_check(node, env):
             static_check(exp, env)
         for left_item in node.left:
             if isinstance(left_item, Var):
+                # Here, if the assignment is not local and the variable is not already defined,
+                # we enforce that it must have been defined earlier.
+                if not node.local and left_item.name not in env:
+                    raise UndefinedVarException(left_item.line, f"Variable '{left_item.name}' is not defined; use local to define new variables")
                 env[left_item.name] = True
             else:
                 static_check(left_item, env)
@@ -822,31 +1022,124 @@ def static_check(node, env):
         pass
 
 #######################
-# Built-in functions for additional Lua features
+# Table Library Extensions
 #######################
-# --- Math Library Extensions ---
-def math_random(*args):
-    if len(args) == 0:
-        return random.random()
-    elif len(args) == 1:
-        return random.randint(1, args[0])
-    elif len(args) == 2:
-        return random.randint(args[0], args[1])
+def table_clear(tbl):
+    if not isinstance(tbl, dict):
+        raise Exception("table.clear expects a table")
+    keys = list(tbl.keys())
+    for key in keys:
+        tbl.pop(key, None)
+    return None
+
+def table_clone(t):
+    if not isinstance(t, dict):
+        raise Exception("table.clone expects a table")
+    new_t = t.copy()
+    new_t.pop("__frozen__", None)
+    return new_t
+
+def table_concat(t, sep="", i=1, j=None):
+    if not isinstance(t, dict):
+        raise Exception("table.concat expects a table")
+    if j is None:
+        j = table_maxn(t)
+    result = ""
+    for index in range(i, j + 1):
+        if index in t:
+            result += str(t[index])
+            if index < j:
+                result += sep
+    return result
+
+def table_create(count, value):
+    try:
+        count = int(count)
+    except:
+        raise Exception("table.create expects count to be a number")
+    return {i: value for i in range(1, count + 1)}
+
+def table_find(haystack, needle, init=1):
+    if not isinstance(haystack, dict):
+        raise Exception("table.find expects a table")
+    max_index = table_maxn(haystack)
+    for i in range(int(init), max_index + 1):
+        if haystack.get(i) == needle:
+            return i
+    return None
+
+def table_freeze(t):
+    if not isinstance(t, dict):
+        raise Exception("table.freeze expects a table")
+    t["__frozen__"] = True
+    return t
+
+def table_isfrozen(t):
+    if not isinstance(t, dict):
+        raise Exception("table.isfrozen expects a table")
+    return t.get("__frozen__", False)
+
+def table_maxn(t):
+    if not isinstance(t, dict):
+        raise Exception("table.maxn expects a table")
+    max_key = 0
+    for key in t:
+        if isinstance(key, int) or (isinstance(key, float) and key.is_integer()):
+            k = int(key)
+            if k > max_key:
+                max_key = k
+    return max_key
+
+def table_move(src, a, b, t, dst=None):
+    if not isinstance(src, dict):
+        raise Exception("table.move expects src to be a table")
+    if dst is None:
+        dst = src
+    for i in range(int(a), int(b) + 1):
+        dst[int(t) + (i - int(a))] = src.get(i)
+    return dst
+
+def table_pack(*values):
+    t = {i: value for i, value in enumerate(values, 1)}
+    t["n"] = len(values)
+    return t
+
+def table_sort(t, comp=None):
+    if not isinstance(t, dict):
+        raise Exception("table.sort expects a table")
+    n = table_maxn(t)
+    arr = [t[i] for i in range(1, n + 1) if i in t]
+    if comp is not None:
+        def cmp_func(a, b):
+            if comp(a, b):
+                return -1
+            elif comp(b, a):
+                return 1
+            else:
+                return 0
+        sorted_arr = sorted(arr, key=cmp_to_key(cmp_func))
     else:
-        raise Exception("math.random expects 0, 1, or 2 arguments")
+        sorted_arr = sorted(arr)
+    for i in range(1, len(sorted_arr) + 1):
+        t[i] = sorted_arr[i - 1]
+    return None
 
-def math_randomseed(x):
-    random.seed(x)
+def table_unpack(t, i=1, j=None):
+    if not isinstance(t, dict):
+        raise Exception("table.unpack expects a table")
+    if j is None:
+        j = table_maxn(t)
+    return tuple(t.get(k) for k in range(int(i), int(j) + 1))
 
-# --- Table Library Extensions ---
+# Modified table_insert: now converts pos to int if possible.
 def table_insert(tbl, value, pos=None):
     if not isinstance(tbl, dict):
         raise Exception("table.insert expects a table")
     if pos is not None:
-        if isinstance(pos, float) and pos.is_integer():
+        try:
             pos = int(pos)
-        elif not isinstance(pos, int):
-            raise Exception("table.insert position must be an integer")
+        except:
+            raise Exception("table.insert position must be convertible to an integer")
     if pos is None:
         indices = [k for k in tbl.keys() if isinstance(k, int)]
         pos = max(indices) + 1 if indices else 1
@@ -855,8 +1148,9 @@ def table_insert(tbl, value, pos=None):
         indices = [k for k in tbl.keys() if isinstance(k, int)]
         max_index = max(indices) if indices else 0
         for i in range(max_index, pos - 1, -1):
-            tbl[i+1] = tbl.get(i)
+            tbl[i + 1] = tbl.get(i)
         tbl[pos] = value
+    tbl["n"] = max(pos, tbl.get("n", 0))
 
 def table_remove(tbl, pos=None):
     if not isinstance(tbl, dict):
@@ -871,24 +1165,14 @@ def table_remove(tbl, pos=None):
     value = tbl[pos]
     max_index = max(indices)
     for i in range(pos, max_index):
-        tbl[i] = tbl.get(i+1)
+        tbl[i] = tbl.get(i + 1)
     if max_index in tbl:
         del tbl[max_index]
     return value
 
-def table_concat(tbl, sep=""):
-    if not isinstance(tbl, dict):
-        raise Exception("table.concat expects a table")
-    result = ""
-    i = 1
-    while i in tbl:
-        result += str(tbl[i])
-        i += 1
-        if i in tbl:
-            result += sep
-    return result
+def table_concat_original(tbl, sep=""):
+    return table_concat(tbl, sep)
 
-# --- String Library Extensions ---
 def string_len(s):
     if not isinstance(s, str):
         raise Exception("string.len expects a string")
@@ -898,9 +1182,9 @@ def string_sub(s, i, j=None):
     if not isinstance(s, str):
         raise Exception("string.sub expects a string")
     if j is None:
-        return s[i-1:]
+        return s[i - 1:]
     else:
-        return s[i-1:j]
+        return s[i - 1:j]
 
 def string_upper(s):
     if not isinstance(s, str):
@@ -967,7 +1251,6 @@ def string_gsub(s, pattern, repl, n=-1):
     result, num = re.subn(pattern, repl, s, count=count)
     return result, num
 
-# --- Built-in Functions ---
 def builtin_select(first, *args):
     if first == "#":
         return len(args)
@@ -978,7 +1261,7 @@ def builtin_select(first, *args):
             raise Exception("select expects a number or '#' as the first argument")
         if n < 1 or n > len(args) + 1:
             return ()
-        return args[n-1:]
+        return args[n - 1:]
 
 def builtin_type(val):
     if val is None:
@@ -1019,8 +1302,102 @@ class UserFunction:
         self.env = env.copy()
 
 #######################
+# Game Library Extensions
+#######################
+_game_state = {}
+
+def game_create_window(width, height, title):
+    win = tk.Toplevel()
+    win.title(str(title))
+    win.geometry(f"{int(width)}x{int(height)}")
+    canvas = tk.Canvas(win, width=int(width), height=int(height), bg="black")
+    canvas.pack()
+    win.focus_set()
+    _game_state['window'] = win
+    _game_state['canvas'] = canvas
+    _game_state['last_update'] = time.time()
+    return None
+
+def game_clear(color):
+    canvas = _game_state.get('canvas')
+    if canvas is None:
+        raise Exception("No game window created. Call game.create_window first.")
+    canvas.delete("all")
+    canvas.config(bg=str(color))
+    return None
+
+def game_draw_rect(x, y, width, height, color):
+    canvas = _game_state.get('canvas')
+    if canvas is None:
+        raise Exception("No game window created. Call game.create_window first.")
+    canvas.create_rectangle(float(x), float(y), float(x) + float(width), float(y) + float(height), fill=str(color), outline=str(color))
+    return None
+
+def game_draw_line(x1, y1, x2, y2, color):
+    canvas = _game_state.get('canvas')
+    if canvas is None:
+        raise Exception("No game window created. Call game.create_window first.")
+    canvas.create_line(float(x1), float(y1), float(x2), float(y2), fill=str(color))
+    return None
+
+def game_draw_polygon(*args):
+    canvas = _game_state.get('canvas')
+    if canvas is None:
+        raise Exception("No game window created. Call game.create_window first.")
+    if len(args) < 7:
+        raise Exception("game.draw_polygon requires at least 7 arguments: at least 3 pairs of coordinates and a color")
+    color = args[-1]
+    points = [float(val) for val in args[:-1]]
+    if len(points) % 2 != 0:
+        raise Exception("Coordinates must be provided in pairs")
+    canvas.create_polygon(points, fill=str(color), outline=str(color))
+    return None
+
+def game_update():
+    win = _game_state.get('window')
+    if win is None:
+        raise Exception("No game window created. Call game.create_window first.")
+    _game_state['last_update'] = time.time()
+    win.update_idletasks()
+    win.update()
+    return None
+
+def game_set_key_handler(callback):
+    win = _game_state.get('window')
+    if win is None:
+        raise Exception("No game window created. Call game.create_window first.")
+    _game_state['key_handler'] = callback
+    def game_key_event(event):
+        try:
+            if isinstance(_game_state.get('key_handler'), UserFunction):
+                interpreter = _game_state.get('interpreter')
+                if interpreter is None:
+                    raise Exception("No interpreter available for callback")
+                interpreter.call_function(_game_state['key_handler'], event.char)
+            else:
+                _game_state['key_handler'](event.char)
+        except Exception as e:
+            print("Error in key handler:", e)
+    win.bind("<KeyPress>", game_key_event)
+    return None
+
+#######################
 # Interpreter and Built-in Functions
 #######################
+def math_random(*args):
+    if len(args) == 0:
+        return random.random()
+    elif len(args) == 1:
+        return random.randint(1, args[0])
+    elif len(args) == 2:
+        return random.randint(args[0], args[1])
+    else:
+        raise Exception("math.random expects 0, 1, or 2 arguments")
+
+
+def math_randomseed(x):
+    random.seed(x)
+
 class Interpreter:
     def __init__(self, tree, output_callback=print):
         self.tree = tree
@@ -1030,6 +1407,7 @@ class Interpreter:
         self.env['wait'] = self.builtin_wait
         self.env['require'] = self.builtin_require
         self.env['pairs'] = self.builtin_pairs
+        self.env['ipairs'] = builtin_ipairs
         self.env['select'] = builtin_select
         self.env['type'] = builtin_type
         self.env['tostring'] = builtin_tostring
@@ -1039,32 +1417,53 @@ class Interpreter:
             'acos': math.acos,
             'asin': math.asin,
             'atan': math.atan,
+            'atan2': math.atan2,
             'ceil': math.ceil,
+            'clamp': clamp,
             'cos': math.cos,
             'cosh': math.cosh,
             'deg': math.degrees,
             'exp': math.exp,
             'floor': math.floor,
             'fmod': math.fmod,
+            'frexp': math.frexp,
+            'ldexp': math.ldexp,
+            'lerp': lerp,
             'log': math.log,
+            'log10': math.log10,
+            'map': map_value,
             'max': max,
             'min': min,
-            'pi': math.pi,
-            'rad': math.radians,
-            'sin': math.sin,
-            'sinh': math.sinh,
-            'sqrt': math.sqrt,
-            'tan': math.tan,
-            'tanh': math.tanh,
-            'random': math_random,
-            'randomseed': math_randomseed,
             'modf': math.modf,
-            'pow': math.pow
+            'noise': noise,
+            'pow': math.pow,
+            'rad': math.radians,
+            'round': round,
+            'sign': sign,
+            'sin': math.sin,
+            'tanh': math.tanh,
+            'sqrt': math.sqrt,
+            'cbrt': cbrt,
+            'huge': sys.float_info.max,
+            'pi': math.pi,
+            'random': math_random,
+            'randomseed': math_randomseed
         }
         self.env['table'] = {
+            'clear': table_clear,
+            'clone': table_clone,
+            'concat': table_concat,
+            'create': table_create,
+            'find': table_find,
+            'freeze': table_freeze,
+            'isfrozen': table_isfrozen,
+            'maxn': table_maxn,
+            'move': table_move,
             'insert': table_insert,
             'remove': table_remove,
-            'concat': table_concat
+            'pack': table_pack,
+            'sort': table_sort,
+            'unpack': table_unpack
         }
         self.env['string'] = {
             'len': string_len,
@@ -1079,6 +1478,52 @@ class Interpreter:
             'format': string_format,
             'gsub': string_gsub
         }
+        self.env['task'] = {
+            'spawn': task_spawn,
+            'defer': task_defer,
+            'delay': task_delay,
+            'desynchronize': task_desynchronize,
+            'synchronize': task_synchronize,
+            'wait': task_wait,
+            'cancel': task_cancel
+        }
+        self.env['os'] = {
+            'clock': os_clock,
+            'date': os_date,
+            'difftime': os_difftime,
+            'time': os_time
+        }
+        self.env['game'] = {
+            'create_window': game_create_window,
+            'clear': game_clear,
+            'draw_rect': game_draw_rect,
+            'draw_line': game_draw_line,
+            'draw_polygon': game_draw_polygon,
+            'update': game_update,
+            'set_key_handler': game_set_key_handler,
+        }
+        _game_state['interpreter'] = self
+        self.start_time = time.time()
+
+    def check_timeout(self):
+        pass
+
+    def call_function(self, func, *args):
+        if len(args) != len(func.params):
+            self.error(f"Function expected {len(func.params)} args, got {len(args)}")
+        new_env = func.env.copy()
+        for param, arg in zip(func.params, args):
+            new_env[param] = arg
+        old_env = self.env
+        self.env = new_env
+        try:
+            self.visit(func.body)
+        except ReturnException as ret:
+            result = ret.value
+        else:
+            result = None
+        self.env = old_env
+        return result
 
     def builtin_wait(self, t):
         try:
@@ -1090,6 +1535,7 @@ class Interpreter:
             if self.should_stop:
                 self.error("Execution stopped.")
             time.sleep(0.01)
+            self.check_timeout()
 
     def builtin_require(self, filename):
         if not isinstance(filename, str):
@@ -1132,11 +1578,13 @@ class Interpreter:
         raise Exception("Runtime error: " + msg)
 
     def run(self):
+        self.start_time = time.time()
         self.visit(self.tree)
 
     def visit(self, node):
         if self.should_stop:
             self.error("Execution stopped.")
+        self.check_timeout()
         method_name = 'visit_' + type(node).__name__
         visitor = getattr(self, method_name, self.generic_visit)
         return visitor(node)
@@ -1190,7 +1638,6 @@ class Interpreter:
                 return table[field]
             self.error(f"Field '{field}' not found in table")
         elif isinstance(table, str):
-            # Support method call on strings using the built-in string library.
             string_lib = self.env.get('string', {})
             if field in string_lib:
                 return lambda *args: string_lib[field](table, *args)
@@ -1280,6 +1727,9 @@ class Interpreter:
             values.extend([None] * (len(node.left) - len(values)))
         for var_node, value in zip(node.left, values):
             if isinstance(var_node, Var):
+                # Enforce that new variables must be defined with local
+                if not node.local and var_node.name not in self.env:
+                    self.error("Variable '" + var_node.name + "' is not defined; use local to define new variables")
                 self.env[var_node.name] = value
             elif isinstance(var_node, TableAccess):
                 target = self.visit(var_node.table_expr)
@@ -1414,7 +1864,8 @@ class LuaIDE(tk.Tk):
         self.geometry("900x700")
         self.configure(bg="#21252B")
 
-        self.completion_words = list(KEYWORDS) + ['wait', 'require', 'pairs', 'select', 'type', 'tostring', 'tonumber', 'math', 'table', 'string']
+        self.completion_words = list(KEYWORDS) + ['wait', 'require', 'pairs', 'ipairs', 'select', 'type', 'tostring',
+                                                  'tonumber', 'math', 'table', 'string', 'game', 'task', 'os']
         self.completion_box = None
         self.current_interpreter = None
         self.run_thread = None
@@ -1427,11 +1878,11 @@ class LuaIDE(tk.Tk):
         self.config(menu=menubar)
 
         self.editor = ScrolledText(self, height=20, font=("Consolas", 14),
-                                     bg="#282C34", fg="#ABB2BF", insertbackground="white",
-                                     undo=True, wrap=tk.NONE)
+                                   bg="#282C34", fg="#ABB2BF", insertbackground="white",
+                                   undo=True, wrap=tk.NONE)
         self.editor.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         sample = (
-            "-- UPDATE 2.7.1 --\n"
+            "-- UPDATE 3.0.0 --\n"
             "-- This is a comment using '--' as in real Lua\n"
             "local e = { name = \"hero\", attack = function(self) -- Performs an attack\n"
             "    print(self.name .. \" attacks!\")\n"
@@ -1458,6 +1909,9 @@ class LuaIDE(tk.Tk):
             "-- Multiple assignment example:\n"
             "local x, y = 1, 2\n"
             "print(\"x: \" .. x .. \", y: \" .. y)\n\n"
+            "-- Compound assignment example:\n"
+            "x += 1\n"
+            "print(\"x after += 1: \" .. x)\n\n"
             "-- select() example:\n"
             "print(\"Number of extra arguments: \" .. select(\"#\", 10, 20, 30))\n"
             "local extras = {select(2, 10, 20, 30)}\n"
@@ -1468,7 +1922,11 @@ class LuaIDE(tk.Tk):
             "end\n\n"
             "-- For-in loop example using pairs:\n"
             "for key, value in pairs({a=1, b=2, c=3}) do\n"
-            "    print(key .. ' : '  .. value)\n"
+            "    print(key .. \" : \"  .. value)\n"
+            "end\n\n"
+            "-- For-in loop example using ipairs:\n"
+            "for index, value in ipairs({10, 20, 30}) do\n"
+            "    print(index .. \" => \" .. value)\n"
             "end\n\n"
             "-- Repeat-until loop example:\n"
             "local count = 0\n"
@@ -1476,38 +1934,33 @@ class LuaIDE(tk.Tk):
             "    count = count + 1\n"
             "    print(\"Count: \" .. count)\n"
             "until count >= 3\n\n"
-            "-- Math library examples:\n"
-            "print(\"Square root of 16 is \" .. math.sqrt(16))\n"
-            "print(\"Value of pi is \" .. math.pi)\n"
-            "print(\"Random number between 1 and 100: \" .. math.random(1,100))\n\n"
-            "-- Table library examples:\n"
-            "local arr = {\"a\", \"b\", \"c\"}\n"
-            "table.insert(arr, \"d\")\n"
-            "print(\"After insert: \" .. table.concat(arr, \",\"))\n"
-            "local removed = table.remove(arr, 2)\n"
-            "print(\"Removed element: \" .. removed)\n"
-            "print(\"After remove: \" .. table.concat(arr, \",\"))\n\n"
-            "-- String library examples:\n"
-            "print(\"Length of 'hello' is \" .. string.len(\"hello\"))\n"
-            "print(\"Uppercase: \" .. string.upper(\"hello\"))\n"
-            "print(\"Substring: \" .. string.sub(\"hello\", 2, 4))\n"
-            "print(\"Character from code 97: \" .. string.char(97))\n"
-            "print(\"Byte value of first char: \" .. string.byte(\"hello\"))\n"
-            "print(\"Reverse of 'hello': \" .. string.reverse(\"hello\"))\n"
-            "print(\"Repeat 'ha' 3 times: \" .. string.rep(\"ha\", 3))\n\n"
-            "-- Table indexing examples:\n"
-            "local t = { a = 1, b = 2, [\"c\"] = 3 }\n"
-            "print(\"Value at key 'c': \" .. t[\"c\"])\n"
-            "t[\"d\"] = 4\n"
-            "print(\"Value at key 'd': \" .. t[\"d\"])\n\n"
-            "-- Negative number and exponentiation example:\n"
-            "print(\"-2^2 should be -4: \" .. -2^2)  -- parsed as -(2^2) prints -4\n"
-            "print(\"(-2)^2 should be 4: \" .. (-2)^2)  -- prints 4\n\n"
-            "-- Operators examples:\n"
-            "-- Exponentiation: local exp = 2 ^ 3\n"
-            "-- Floor division: local flDiv = 10 // 3\n"
-            "-- Modulo: local mod = 10 % 3\n"
-            "-- Logical: if damage >= 10 and damage ~= 15 then print(\"High damage\") end\n"
+            "-- Math library extended examples:\n"
+            "print(\"clamp(15, 0, 10): \" .. math.clamp(15, 0, 10))\n"
+            "print(\"lerp(0, 100, 0.5): \" .. math.lerp(0, 100, 0.5))\n"
+            "print(\"map(5, 0, 10, 0, 100): \" .. math.map(5, 0, 10, 0, 100))\n"
+            "print(\"sign(-10): \" .. math.sign(-10))\n"
+            "print(\"sin(1): \" .. math.sin(1))\n"
+            "print(\"tanh(1): \" .. math.tanh(1))\n"
+            "print(\"sqrt(16): \" .. math.sqrt(16))\n"
+            "print(\"cbrt(27): \" .. math.cbrt(27))\n\n"
+            "-- Task library examples:\n"
+            "task.spawn(function() print(\"Hello from spawn!\") end)\n"
+            "task.delay(1, function() print(\"Hello after 1 second delay\") end)\n\n"
+            "-- OS library examples:\n"
+            "print(\"os.clock: \" .. os.clock())\n"
+            "print(\"os.date: \" .. os.date(\"%Y-%m-%d %H:%M:%S\"))\n"
+            "print(\"os.difftime: \" .. os.difftime(os.time(), 0))\n"
+            "print(\"os.time: \" .. os.time())\n\n"
+            "-- Game Library Examples:\n"
+            "game.create_window(400, 300, \"My Game\")\n"
+            "game.clear(\"#000080\")\n"
+            "game.draw_rect(50, 50, 100, 75, \"red\")\n"
+            "game.draw_line(50, 50, 150, 150, \"green\")\n"
+            "game.draw_polygon(100, 100, 150, 50, 200, 100, \"yellow\")\n"
+            "game.set_key_handler(function(key)\n"
+            "    print(\"Key pressed: \" .. key)\n"
+            "end)\n"
+            "game.update()\n"
         )
         self.editor.insert(tk.END, sample)
 
@@ -1524,7 +1977,7 @@ class LuaIDE(tk.Tk):
         self.stop_button.pack(side=tk.LEFT, padx=5)
 
         self.output = ScrolledText(self, height=10, font=("Consolas", 14),
-                                     bg="#21252B", fg="white", state=tk.NORMAL)
+                                   bg="#21252B", fg="white", state=tk.NORMAL)
         self.output.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         self.setup_tags()
@@ -1544,7 +1997,7 @@ class LuaIDE(tk.Tk):
 
     def save_file(self):
         filename = filedialog.asksaveasfilename(defaultextension=".lua",
-                                                  filetypes=[("Lua files", "*.lua"), ("All files", "*.*")])
+                                                filetypes=[("Lua files", "*.lua"), ("All files", "*.*")])
         if filename:
             code = self.editor.get("1.0", tk.END)
             with open(filename, "w") as f:
@@ -1557,19 +2010,23 @@ class LuaIDE(tk.Tk):
     def run_code(self):
         code = self.editor.get(1.0, tk.END)
         self.output.delete(1.0, tk.END)
+
         def run_interpreter():
             try:
                 lexer = Lexer(code)
                 tokens = lexer.tokenize()
                 parser = Parser(tokens)
                 tree = parser.parse()
-                static_check(tree, {"wait": True, "require": True, "pairs": True, "select": True, "type": True, "tostring": True, "tonumber": True, "math": True, "table": True, "string": True})
+                static_check(tree, {"wait": True, "require": True, "pairs": True, "ipairs": True, "select": True,
+                                    "type": True, "tostring": True, "tonumber": True, "math": True, "table": True,
+                                    "string": True, "game": True, "task": True, "os": True})
                 self.current_interpreter = Interpreter(tree, output_callback=self.append_output)
                 self.current_interpreter.should_stop = False
                 self.current_interpreter.env['require'] = self.current_interpreter.builtin_require
                 self.current_interpreter.run()
             except Exception as e:
                 self.append_output("Error: " + str(e))
+
         self.run_thread = threading.Thread(target=run_interpreter)
         self.run_thread.start()
 
@@ -1626,7 +2083,6 @@ class LuaIDE(tk.Tk):
     def show_autocomplete(self):
         pos = self.editor.index(tk.INSERT)
         line_text = self.editor.get("insert linestart", "insert lineend")
-        # Check for table member access (e.g. table.method)
         m = re.search(r'(\w+)\.(\w*)$', line_text)
         if m:
             mod_name = m.group(1)
@@ -1647,10 +2103,8 @@ class LuaIDE(tk.Tk):
             if completions:
                 self.show_completion_box(completions, pos)
                 return
-        # Get the current word prefix
         prefix_match = re.findall(r'(\w+)$', line_text)
         prefix = prefix_match[0] if prefix_match else ""
-        # Only show autocomplete if prefix is not empty
         if not prefix:
             self.hide_completion_box()
             return
@@ -1664,55 +2118,23 @@ class LuaIDE(tk.Tk):
         if self.completion_box:
             self.completion_box.destroy()
         self.completion_box = tk.Listbox(self, height=len(completions), font=("Consolas", 12))
-        for word in completions:
-            self.completion_box.insert(tk.END, word)
-        self.completion_box.bind("<<ListboxSelect>>", self.complete_word)
-        bbox = self.editor.bbox(tk.INSERT)
-        if bbox:
-            x, y, width, height = bbox
-            abs_x = self.editor.winfo_rootx() + x
-            abs_y = self.editor.winfo_rooty() + y + height
-            self.completion_box.place(x=abs_x, y=abs_y)
-        else:
-            self.completion_box.place(x=100, y=100)
+        for comp in completions:
+            self.completion_box.insert(tk.END, comp)
+        self.completion_box.place(x=100, y=100)
+        self.completion_box.bind("<<ListboxSelect>>", self.insert_completion)
 
     def hide_completion_box(self):
         if self.completion_box:
             self.completion_box.destroy()
             self.completion_box = None
 
-    def complete_word(self, event):
-        if not self.completion_box:
-            return
-        selection = self.completion_box.get(tk.ACTIVE)
-        if " - " in selection:
-            selection = selection.split(" - ")[0]
-        pos = self.editor.index(tk.INSERT)
-        line, char = map(int, pos.split('.'))
-        line_text = self.editor.get(f"{line}.0", f"{line}.end")
-        new_line_text = re.sub(r'(\w+)$', selection, line_text)
-        self.editor.delete(f"{line}.0", f"{line}.end")
-        self.editor.insert(f"{line}.0", new_line_text)
-        self.hide_completion_box()
-
-    def handle_return(self, event):
-        current_index = self.editor.index(tk.INSERT)
-        line_number = int(current_index.split('.')[0])
-        line_start = f"{line_number}.0"
-        line_text = self.editor.get(line_start, f"{line_number}.end")
-        indent_match = re.match(r'^(\s*)', line_text)
-        indent = indent_match.group(1) if indent_match else ""
-        if re.search(r'\b(function|while|if|for|repeat)\b', line_text):
-            next_line = self.editor.get(f"{line_number+1}.0", f"{line_number+1}.end")
-            if next_line.strip() != "end" and next_line.strip() != "until":
-                new_indent = indent + "    "
-                self.editor.insert(tk.INSERT, "\n" + new_indent + "\n" + indent + "end")
-                self.editor.mark_set("insert", f"{line_number + 1}.{len(indent) + 4}")
-            else:
-                self.editor.insert(tk.INSERT, "\n" + indent)
-        else:
-            self.editor.insert(tk.INSERT, "\n" + indent)
-        return "break"
+    def insert_completion(self, event):
+        if self.completion_box:
+            selection = self.completion_box.curselection()
+            if selection:
+                comp = self.completion_box.get(selection[0])
+                self.editor.insert(tk.INSERT, comp)
+            self.hide_completion_box()
 
     def check_syntax(self):
         self.editor.tag_remove("error", "1.0", tk.END)
@@ -1723,7 +2145,10 @@ class LuaIDE(tk.Tk):
             tokens = lexer.tokenize()
             parser = Parser(tokens)
             ast = parser.parse()
-            static_check(ast, {"wait": True, "require": True, "pairs": True, "select": True, "type": True, "tostring": True, "tonumber": True, "math": True, "table": True, "string": True})
+            static_check(ast,
+                         {"wait": True, "require": True, "pairs": True, "ipairs": True, "select": True, "type": True,
+                          "tostring": True, "tonumber": True, "math": True, "table": True, "string": True, "game": True,
+                          "task": True, "os": True})
         except Exception as e:
             err_msg = str(e)
             m = re.search(r'line (\d+)', err_msg)
@@ -1731,6 +2156,10 @@ class LuaIDE(tk.Tk):
                 error_line = m.group(1)
                 self.editor.tag_add("error", f"{error_line}.0", f"{error_line}.end")
 
-if __name__ == '__main__':
-    app = LuaIDE()
-    app.mainloop()
+    def handle_return(self, event):
+        self.on_key_release(event)
+        return None
+
+if __name__ == "__main__":
+    ide = LuaIDE()
+    ide.mainloop()
