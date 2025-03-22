@@ -997,7 +997,7 @@ class LuaIDE(tk.Tk):
                                      undo=True, wrap=tk.NONE)
         self.editor.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         sample = (
-            "-- Type your Lua code here\n"
+            "-- UPDATE 1.0.0 --\n"
             "local e = { name = \"hero\", attack = function(self) -- Performs an attack\n"
             "    print(self.name .. \" attacks!\")\n"
             "    return 10\n"
