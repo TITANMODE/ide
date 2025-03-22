@@ -133,8 +133,8 @@ class Lexer:
             if self.current_char == '.' and self.peek() == '.':
                 self.advance(); self.advance()
                 return Token(TT_OP, '..', self.line)
-            # Added support for '[' , ']', and '#' (as length operator) and '-' as operator.
-            if self.current_char in "+-*/=(),<>{}.%^#[]":
+            # Added support for ':' along with '[' , ']', '#' (as length operator) and '-' as operator.
+            if self.current_char in "+-*/=(),<>{}.%^#[]:":
                 ch = self.current_char
                 self.advance()
                 return Token(TT_OP, ch, self.line)
@@ -481,12 +481,17 @@ class Parser:
         if self.current_token.type == TT_IDENT:
             name = self.current_token.value
             self.eat(TT_IDENT)
-            if self.current_token.type == TT_OP and self.current_token.value == '.':
-                self.eat(TT_OP, '.')
+            # Check for method definition (using ':' or '.')
+            if self.current_token.type == TT_OP and self.current_token.value in ('.', ':'):
+                op = self.current_token.value
+                self.eat(TT_OP, op)
                 field = self.current_token.value
                 self.eat(TT_IDENT)
                 self.eat(TT_OP, '(')
                 params = []
+                if op == ':':
+                    # Colon syntax automatically adds 'self' as first parameter
+                    params.append("self")
                 if not (self.current_token.type == TT_OP and self.current_token.value == ')'):
                     params.append(self.current_token.value)
                     self.eat(TT_IDENT)
@@ -596,9 +601,6 @@ class Parser:
             node = BinOp(node, op, right)
         return node
 
-    # New production for unary expressions.
-    # For Lua, unary minus (-) has lower precedence than exponentiation,
-    # so when '-' is encountered, we call power_expr() to allow correct associativity.
     def unary_expr(self):
         if self.current_token.type == TT_KEYWORD and self.current_token.value == 'not':
             op = self.current_token
@@ -618,8 +620,6 @@ class Parser:
         else:
             return self.power_expr()
 
-    # New production for exponentiation expressions.
-    # Exponentiation (^) is right-associative.
     def power_expr(self):
         node = self.postfix_expr()
         if self.current_token.type == TT_OP and self.current_token.value == '^':
@@ -647,6 +647,20 @@ class Parser:
                 field = self.current_token.value
                 self.eat(TT_IDENT)
                 node = TableAccess(node, field)
+            elif self.current_token.type == TT_OP and self.current_token.value == ':':
+                # Handle method call: table:method(args) becomes table.method(table, args)
+                self.eat(TT_OP, ':')
+                field = self.current_token.value
+                self.eat(TT_IDENT)
+                self.eat(TT_OP, '(')
+                args = []
+                if not (self.current_token.type == TT_OP and self.current_token.value == ')'):
+                    args.append(self.expr())
+                    while self.current_token.type == TT_OP and self.current_token.value == ',':
+                        self.eat(TT_OP, ',')
+                        args.append(self.expr())
+                self.eat(TT_OP, ')')
+                node = Call(TableAccess(node, field), [node] + args)
             elif self.current_token.type == TT_OP and self.current_token.value == '[':
                 self.eat(TT_OP, '[')
                 index_expr = self.expr()
@@ -667,7 +681,6 @@ class Parser:
         elif tok.type == TT_KEYWORD and tok.value in ('true', 'false'):
             self.eat(TT_KEYWORD, tok.value)
             return Boolean(tok.value)
-        # Handle nil literal
         elif tok.type == TT_KEYWORD and tok.value == 'nil':
             self.eat(TT_KEYWORD, 'nil')
             return Nil()
@@ -694,7 +707,6 @@ class Parser:
         self.eat(TT_OP, '{')
         entries = []
         while not (self.current_token.type == TT_OP and self.current_token.value == '}'):
-            # Support for key in brackets: [expr] = value
             if self.current_token.type == TT_OP and self.current_token.value == '[':
                 self.eat(TT_OP, '[')
                 key_expr = self.expr()
@@ -808,7 +820,6 @@ def static_check(node, env):
         static_check(node.expr, env)
     elif isinstance(node, Nil):
         pass
-    # Numbers, Strings, Booleans: nothing to check.
 
 #######################
 # Built-in functions for additional Lua features
@@ -844,7 +855,6 @@ def table_insert(tbl, value, pos=None):
         for i in range(max_index, pos - 1, -1):
             tbl[i+1] = tbl.get(i)
         tbl[pos] = value
-
 
 def table_remove(tbl, pos=None):
     if not isinstance(tbl, dict):
@@ -899,7 +909,6 @@ def string_lower(s):
         raise Exception("string.lower expects a string")
     return s.lower()
 
-# Built-in select: returns the count or a list of varargs starting from a given index (Lua indices start at 1)
 def builtin_select(first, *args):
     if first == "#":
         return len(args)
@@ -909,10 +918,9 @@ def builtin_select(first, *args):
         except:
             raise Exception("select expects a number or '#' as the first argument")
         if n < 1 or n > len(args) + 1:
-            return ()  # In Lua, if n is out of bounds, it returns nothing
+            return ()
         return args[n-1:]
 
-# Additional built-in: type, tostring, tonumber
 def builtin_type(val):
     if val is None:
         return "nil"
@@ -960,7 +968,6 @@ class Interpreter:
         self.env = {}
         self.output_callback = output_callback
         self.should_stop = False
-        # Built-in functions and libraries
         self.env['wait'] = self.builtin_wait
         self.env['require'] = self.builtin_require
         self.env['pairs'] = self.builtin_pairs
@@ -1192,10 +1199,8 @@ class Interpreter:
 
     def visit_Assignment(self, node):
         values = [self.visit(exp) for exp in node.expr]
-        # Fill missing values with nil (None) if there are fewer expressions than variables
         if len(values) < len(node.left):
             values.extend([None] * (len(node.left) - len(values)))
-        # If there are more expressions than variables, ignore extras
         for var_node, value in zip(node.left, values):
             if isinstance(var_node, Var):
                 self.env[var_node.name] = value
@@ -1349,7 +1354,7 @@ class LuaIDE(tk.Tk):
                                      undo=True, wrap=tk.NONE)
         self.editor.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         sample = (
-            "-- UPDATE 2.5.0 --\n"
+            "-- UPDATE 2.5.1 --\n"
             "-- This is a comment using '--' as in real Lua\n"
             "local e = { name = \"hero\", attack = function(self) -- Performs an attack\n"
             "    print(self.name .. \" attacks!\")\n"
@@ -1358,10 +1363,10 @@ class LuaIDE(tk.Tk):
             "function double(x) -- Doubles the input value\n"
             "    return x * 2\n"
             "end\n\n"
-            "-- Table member function definition\n"
-            "-- function TestModule.doTask(player) -- Executes a task for the player\n"
-            "--    print(\"Task executed\")\n"
-            "-- end\n\n"
+            "-- Table member function definition using colon syntax\n"
+            "function e:heal(amount)\n"
+            "    print(self.name .. \" heals for \" .. amount)\n"
+            "end\n\n"
             "if e.name == \"hero\" then\n"
             "    print(\"Welcome, \" .. e.name)\n"
             "elseif e.name == \"villain\" then\n"
@@ -1371,6 +1376,8 @@ class LuaIDE(tk.Tk):
             "end\n\n"
             "local damage = e.attack(e)\n"
             "print(\"Damage dealt: \" .. double(damage))\n\n"
+            "-- Calling a method using colon syntax\n"
+            "e:heal(15)\n\n"
             "-- Multiple assignment example:\n"
             "local x, y = 1, 2\n"
             "print(\"x: \" .. x .. \", y: \" .. y)\n\n"
@@ -1538,6 +1545,7 @@ class LuaIDE(tk.Tk):
     def show_autocomplete(self):
         pos = self.editor.index(tk.INSERT)
         line_text = self.editor.get("insert linestart", "insert lineend")
+        # Check for table member access (e.g. table.method)
         m = re.search(r'(\w+)\.(\w*)$', line_text)
         if m:
             mod_name = m.group(1)
@@ -1558,8 +1566,13 @@ class LuaIDE(tk.Tk):
             if completions:
                 self.show_completion_box(completions, pos)
                 return
+        # Get the current word prefix
         prefix_match = re.findall(r'(\w+)$', line_text)
         prefix = prefix_match[0] if prefix_match else ""
+        # Only show autocomplete if prefix is not empty
+        if not prefix:
+            self.hide_completion_box()
+            return
         completions = [w for w in self.completion_words if w.startswith(prefix)]
         if completions:
             self.show_completion_box(completions, pos)
