@@ -4,6 +4,8 @@ from tkinter import filedialog
 import re
 import time
 import threading
+import math
+import random
 
 #######################
 # Lexer
@@ -15,11 +17,11 @@ TT_KEYWORD = 'KEYWORD'
 TT_OP = 'OP'
 TT_EOF = 'EOF'
 
-# Keywords (note: "wait", "break", "require", and now "pairs" are built-ins)
+# Keywords (added "nil", "repeat", "until", and "elseif")
 KEYWORDS = {
-    'if', 'then', 'else', 'end', 'while', 'do', 'print',
+    'if', 'then', 'else', 'elseif', 'end', 'while', 'do', 'print',
     'local', 'true', 'false', 'for', 'in', 'and', 'or', 'not',
-    'function', 'return', 'break'
+    'function', 'return', 'break', 'nil', 'repeat', 'until'
 }
 
 class Token:
@@ -129,7 +131,8 @@ class Lexer:
                 return self.string()
             if self.current_char.isalpha() or self.current_char == '_':
                 return self.identifier()
-            if self.current_char in "+-*/=(),<>{}.%^":
+            # Added support for '[' and ']'
+            if self.current_char in "+-*/=(),<>{}.%^[]":
                 ch = self.current_char
                 self.advance()
                 return Token(TT_OP, ch, self.line)
@@ -163,6 +166,25 @@ class Boolean(AST):
     def __init__(self, value):
         self.value = True if value == 'true' else False
 
+# New AST node for nil literal
+class Nil(AST):
+    def __init__(self):
+        pass
+    def __repr__(self):
+        return "Nil"
+
+# New AST node for repeat-until loop
+class RepeatUntil(AST):
+    def __init__(self, block, condition):
+        self.block = block  # list of statements
+        self.condition = condition
+
+# New AST node for table indexing using square brackets
+class TableIndex(AST):
+    def __init__(self, table_expr, index_expr):
+        self.table_expr = table_expr
+        self.index_expr = index_expr
+
 # ForIn now holds a list of variables.
 class Var(AST):
     def __init__(self, name, line=None):
@@ -190,7 +212,7 @@ class BinOp(AST):
 
 class Assignment(AST):
     def __init__(self, left, expr, local=False):
-        self.left = left  # Var or TableAccess
+        self.left = left  # Var or TableAccess or TableIndex
         self.expr = expr
         self.local = local
 
@@ -198,11 +220,12 @@ class Print(AST):
     def __init__(self, expr):
         self.expr = expr
 
+# Modified If node; elseif clauses are built as nested If nodes.
 class If(AST):
     def __init__(self, cond, then_block, else_block=None):
         self.cond = cond
-        self.then_block = then_block
-        self.else_block = else_block
+        self.then_block = then_block  # list of statements
+        self.else_block = else_block  # list of statements or nested If
 
 class While(AST):
     def __init__(self, cond, body):
@@ -284,7 +307,7 @@ class Parser:
 
     def statement_list(self):
         stmts = []
-        while self.current_token.type != TT_EOF and self.current_token.value not in ('else', 'end'):
+        while self.current_token.type != TT_EOF and self.current_token.value not in ('else', 'elseif', 'end', 'until'):
             stmt = self.statement()
             if stmt is not None:
                 stmts.append(stmt)
@@ -300,6 +323,13 @@ class Parser:
                 return self.while_statement()
             elif self.current_token.value == 'for':
                 return self.for_statement()
+            elif self.current_token.value == 'repeat':
+                return self.repeat_until_statement()
+            elif self.current_token.value == 'do':
+                self.eat(TT_KEYWORD, 'do')
+                block = self.statement_list()
+                self.eat(TT_KEYWORD, 'end')
+                return Block(block)
             elif self.current_token.value == 'print':
                 return self.print_statement()
             elif self.current_token.value == 'function':
@@ -311,7 +341,7 @@ class Parser:
                 return Break()
             else:
                 return self.expr()
-        if self.current_token.type == TT_IDENT or (self.current_token.type == TT_OP and self.current_token.value == '{'):
+        if self.current_token.type == TT_IDENT or (self.current_token.type == TT_OP and self.current_token.value in ('{', '[')):
             start_pos = self.pos
             expr_node = self.expr()
             if self.current_token.type == TT_OP and self.current_token.value == '=':
@@ -382,12 +412,27 @@ class Parser:
         cond = self.expr()
         self.eat(TT_KEYWORD, 'then')
         then_block = self.statement_list()
-        else_block = None
-        if self.current_token.type == TT_KEYWORD and self.current_token.value == 'else':
+        else_clause = None
+        if self.current_token.type == TT_KEYWORD and self.current_token.value == 'elseif':
+            else_clause = [self.parse_elseif()]
+        elif self.current_token.type == TT_KEYWORD and self.current_token.value == 'else':
             self.eat(TT_KEYWORD, 'else')
-            else_block = self.statement_list()
+            else_clause = self.statement_list()
         self.eat(TT_KEYWORD, 'end')
-        return If(cond, then_block, else_block)
+        return If(cond, then_block, else_clause)
+
+    def parse_elseif(self):
+        self.eat(TT_KEYWORD, 'elseif')
+        cond = self.expr()
+        self.eat(TT_KEYWORD, 'then')
+        then_block = self.statement_list()
+        else_clause = None
+        if self.current_token.type == TT_KEYWORD and self.current_token.value == 'elseif':
+            else_clause = [self.parse_elseif()]
+        elif self.current_token.type == TT_KEYWORD and self.current_token.value == 'else':
+            self.eat(TT_KEYWORD, 'else')
+            else_clause = self.statement_list()
+        return If(cond, then_block, else_clause)
 
     def while_statement(self):
         self.eat(TT_KEYWORD, 'while')
@@ -396,6 +441,13 @@ class Parser:
         body = self.statement_list()
         self.eat(TT_KEYWORD, 'end')
         return While(cond, body)
+
+    def repeat_until_statement(self):
+        self.eat(TT_KEYWORD, 'repeat')
+        block = self.statement_list()
+        self.eat(TT_KEYWORD, 'until')
+        cond = self.expr()
+        return RepeatUntil(block, cond)
 
     def function_def(self):
         self.eat(TT_KEYWORD, 'function')
@@ -544,6 +596,12 @@ class Parser:
                 field = self.current_token.value
                 self.eat(TT_IDENT)
                 node = TableAccess(node, field)
+            # Added support for dynamic table indexing: table[expr]
+            elif self.current_token.type == TT_OP and self.current_token.value == '[':
+                self.eat(TT_OP, '[')
+                index_expr = self.expr()
+                self.eat(TT_OP, ']')
+                node = TableIndex(node, index_expr)
             else:
                 break
         return node
@@ -559,6 +617,10 @@ class Parser:
         elif tok.type == TT_KEYWORD and tok.value in ('true', 'false'):
             self.eat(TT_KEYWORD, tok.value)
             return Boolean(tok.value)
+        # Handle nil literal
+        elif tok.type == TT_KEYWORD and tok.value == 'nil':
+            self.eat(TT_KEYWORD, 'nil')
+            return Nil()
         elif tok.type == TT_KEYWORD and tok.value == 'not':
             self.eat(TT_KEYWORD, 'not')
             expr = self.primary_expr()
@@ -582,9 +644,17 @@ class Parser:
         self.eat(TT_OP, '{')
         entries = []
         while not (self.current_token.type == TT_OP and self.current_token.value == '}'):
-            if (self.current_token.type == TT_IDENT and
-                self.tokens[self.pos + 1].type == TT_OP and
-                self.tokens[self.pos + 1].value == '='):
+            # Support for key in brackets: [expr] = value
+            if self.current_token.type == TT_OP and self.current_token.value == '[':
+                self.eat(TT_OP, '[')
+                key_expr = self.expr()
+                self.eat(TT_OP, ']')
+                self.eat(TT_OP, '=')
+                value = self.expr()
+                entries.append((key_expr, value))
+            elif (self.current_token.type == TT_IDENT and
+                  self.tokens[self.pos + 1].type == TT_OP and
+                  self.tokens[self.pos + 1].value == '='):
                 key_val = self.current_token.value
                 self.eat(TT_IDENT)
                 self.eat(TT_OP, '=')
@@ -617,7 +687,7 @@ def static_check(node, env):
         static_check(node.expr, env)
         if isinstance(node.left, Var):
             env[node.left.name] = True
-        elif isinstance(node.left, TableAccess):
+        elif isinstance(node.left, (TableAccess, TableIndex)):
             static_check(node.left, env)
         else:
             static_check(node.left, env)
@@ -637,6 +707,9 @@ def static_check(node, env):
     elif isinstance(node, While):
         static_check(node.cond, env)
         static_check(Block(node.body), env.copy())
+    elif isinstance(node, RepeatUntil):
+        static_check(Block(node.block), env.copy())
+        static_check(node.condition, env)
     elif isinstance(node, ForIn):
         static_check(node.expr, env)
         new_env = env.copy()
@@ -676,8 +749,13 @@ def static_check(node, env):
             static_check(val, env)
     elif isinstance(node, TableAccess):
         static_check(node.table_expr, env)
+    elif isinstance(node, TableIndex):
+        static_check(node.table_expr, env)
+        static_check(node.index_expr, env)
     elif isinstance(node, Not):
         static_check(node.expr, env)
+    elif isinstance(node, Nil):
+        pass
     # Numbers, Strings, Booleans: nothing to check.
 
 #######################
@@ -696,6 +774,91 @@ class UserFunction:
         self.body = body
         self.env = env.copy()
 
+# Math library built-in functions for Lua-like math module
+def math_random(*args):
+    if len(args) == 0:
+        return random.random()
+    elif len(args) == 1:
+        return random.randint(1, args[0])
+    elif len(args) == 2:
+        return random.randint(args[0], args[1])
+    else:
+        raise Exception("math.random expects 0, 1, or 2 arguments")
+
+def math_randomseed(x):
+    random.seed(x)
+
+# Table library built-in functions
+def table_insert(tbl, value, pos=None):
+    if not isinstance(tbl, dict):
+        raise Exception("table.insert expects a table")
+    if pos is None:
+        indices = [k for k in tbl.keys() if isinstance(k, int)]
+        pos = max(indices) + 1 if indices else 1
+        tbl[pos] = value
+    else:
+        if not isinstance(pos, int):
+            raise Exception("table.insert position must be an integer")
+        indices = [k for k in tbl.keys() if isinstance(k, int)]
+        max_index = max(indices) if indices else 0
+        for i in range(max_index, pos - 1, -1):
+            tbl[i+1] = tbl.get(i)
+        tbl[pos] = value
+
+def table_remove(tbl, pos=None):
+    if not isinstance(tbl, dict):
+        raise Exception("table.remove expects a table")
+    indices = [k for k in tbl.keys() if isinstance(k, int)]
+    if not indices:
+        return None
+    if pos is None:
+        pos = max(indices)
+    if pos not in tbl:
+        raise Exception("Index out of range in table.remove")
+    value = tbl[pos]
+    max_index = max(indices)
+    for i in range(pos, max_index):
+        tbl[i] = tbl.get(i+1)
+    if max_index in tbl:
+        del tbl[max_index]
+    return value
+
+def table_concat(tbl, sep=""):
+    if not isinstance(tbl, dict):
+        raise Exception("table.concat expects a table")
+    result = ""
+    i = 1
+    while i in tbl:
+        result += str(tbl[i])
+        i += 1
+        if i in tbl:
+            result += sep
+    return result
+
+# String library built-in functions
+def string_len(s):
+    if not isinstance(s, str):
+        raise Exception("string.len expects a string")
+    return len(s)
+
+def string_sub(s, i, j=None):
+    if not isinstance(s, str):
+        raise Exception("string.sub expects a string")
+    if j is None:
+        return s[i-1:]
+    else:
+        return s[i-1:j]
+
+def string_upper(s):
+    if not isinstance(s, str):
+        raise Exception("string.upper expects a string")
+    return s.upper()
+
+def string_lower(s):
+    if not isinstance(s, str):
+        raise Exception("string.lower expects a string")
+    return s.lower()
+
 class Interpreter:
     def __init__(self, tree, output_callback=print):
         self.tree = tree
@@ -705,6 +868,42 @@ class Interpreter:
         self.env['wait'] = self.builtin_wait
         self.env['require'] = self.builtin_require
         self.env['pairs'] = self.builtin_pairs
+        self.env['math'] = {
+            'abs': abs,
+            'acos': math.acos,
+            'asin': math.asin,
+            'atan': math.atan,
+            'ceil': math.ceil,
+            'cos': math.cos,
+            'cosh': math.cosh,
+            'deg': math.degrees,
+            'exp': math.exp,
+            'floor': math.floor,
+            'fmod': math.fmod,
+            'log': math.log,
+            'max': max,
+            'min': min,
+            'pi': math.pi,
+            'rad': math.radians,
+            'sin': math.sin,
+            'sinh': math.sinh,
+            'sqrt': math.sqrt,
+            'tan': math.tan,
+            'tanh': math.tanh,
+            'random': math_random,
+            'randomseed': math_randomseed
+        }
+        self.env['table'] = {
+            'insert': table_insert,
+            'remove': table_remove,
+            'concat': table_concat
+        }
+        self.env['string'] = {
+            'len': string_len,
+            'sub': string_sub,
+            'upper': string_upper,
+            'lower': string_lower
+        }
 
     def builtin_wait(self, t):
         try:
@@ -788,6 +987,9 @@ class Interpreter:
     def visit_Boolean(self, node):
         return node.value
 
+    def visit_Nil(self, node):
+        return None
+
     def visit_Var(self, node):
         if node.name in self.env:
             return self.env[node.name]
@@ -811,6 +1013,14 @@ class Interpreter:
         if field in table:
             return table[field]
         self.error(f"Field '{field}' not found in table")
+
+    def visit_TableIndex(self, node):
+        table = self.visit(node.table_expr)
+        index = self.visit(node.index_expr)
+        try:
+            return table[index]
+        except Exception:
+            self.error(f"Index '{index}' not found in table")
 
     def visit_Not(self, node):
         return not self.visit(node.expr)
@@ -858,9 +1068,13 @@ class Interpreter:
         val = self.visit(node.expr)
         if isinstance(node.left, Var):
             self.env[node.left.name] = val
-        elif isinstance(node.left, TableAccess):
-            table = self.visit(node.left.table_expr)
-            table[node.left.field] = val
+        elif isinstance(node.left, (TableAccess, TableIndex)):
+            target = self.visit(node.left.table_expr)
+            if isinstance(node.left, TableAccess):
+                target[node.left.field] = val
+            else:
+                index = self.visit(node.left.index_expr)
+                target[index] = val
         else:
             self.error("Invalid assignment target")
         return val
@@ -885,6 +1099,13 @@ class Interpreter:
                 for stmt in node.body:
                     self.visit(stmt)
             except BreakException:
+                break
+
+    def visit_RepeatUntil(self, node):
+        while True:
+            for stmt in node.block:
+                self.visit(stmt)
+            if self.visit(node.condition):
                 break
 
     def visit_ForIn(self, node):
@@ -980,7 +1201,7 @@ class LuaIDE(tk.Tk):
         self.geometry("900x700")
         self.configure(bg="#21252B")
 
-        self.completion_words = list(KEYWORDS) + ['wait', 'require', 'pairs']
+        self.completion_words = list(KEYWORDS) + ['wait', 'require', 'pairs', 'math', 'table', 'string']
         self.completion_box = None
         self.current_interpreter = None
         self.run_thread = None
@@ -997,7 +1218,7 @@ class LuaIDE(tk.Tk):
                                      undo=True, wrap=tk.NONE)
         self.editor.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         sample = (
-            "-- UPDATE 1.0.0 --\n"
+            "-- UPDATE 2.0.0 --\n"
             "local e = { name = \"hero\", attack = function(self) -- Performs an attack\n"
             "    print(self.name .. \" attacks!\")\n"
             "    return 10\n"
@@ -1011,6 +1232,10 @@ class LuaIDE(tk.Tk):
             "-- end\n\n"
             "if e.name == \"hero\" then\n"
             "    print(\"Welcome, \" .. e.name)\n"
+            "elseif e.name == \"villain\" then\n"
+            "    print(\"Beware of \" .. e.name)\n"
+            "else\n"
+            "    print(\"Unknown character\")\n"
             "end\n\n"
             "local damage = e.attack(e)\n"
             "print(\"Damage dealt: \" .. double(damage))\n\n"
@@ -1022,6 +1247,32 @@ class LuaIDE(tk.Tk):
             "for key, value in pairs({a=1, b=2, c=3}) do\n"
             "    print(key .. ' : '  .. value)\n"
             "end\n\n"
+            "-- Repeat-until loop example:\n"
+            "local count = 0\n"
+            "repeat\n"
+            "    count = count + 1\n"
+            "    print(\"Count: \" .. count)\n"
+            "until count >= 3\n\n"
+            "-- Math library examples:\n"
+            "print(\"Square root of 16 is \" .. math.sqrt(16))\n"
+            "print(\"Value of pi is \" .. math.pi)\n"
+            "print(\"Random number between 1 and 100: \" .. math.random(1,100))\n\n"
+            "-- Table library examples:\n"
+            "local arr = {\"a\", \"b\", \"c\"}\n"
+            "table.insert(arr, \"d\")\n"
+            "print(\"After insert: \" .. table.concat(arr, \",\"))\n"
+            "local removed = table.remove(arr, 2)\n"
+            "print(\"Removed element: \" .. removed)\n"
+            "print(\"After remove: \" .. table.concat(arr, \",\"))\n\n"
+            "-- String library examples:\n"
+            "print(\"Length of 'hello' is \" .. string.len(\"hello\"))\n"
+            "print(\"Uppercase: \" .. string.upper(\"hello\"))\n"
+            "print(\"Substring: \" .. string.sub(\"hello\", 2, 4))\n\n"
+            "-- Table indexing examples:\n"
+            "local t = { a = 1, b = 2, [\"c\"] = 3 }\n"
+            "print(\"Value at key 'c': \" .. t[\"c\"])\n"
+            "t[\"d\"] = 4\n"
+            "print(\"Value at key 'd': \" .. t[\"d\"])\n\n"
             "-- Operators examples:\n"
             "-- Exponentiation: local exp = 2 ^ 3\n"
             "-- Floor division: local flDiv = 10 // 3\n"
@@ -1080,8 +1331,7 @@ class LuaIDE(tk.Tk):
                 tokens = lexer.tokenize()
                 parser = Parser(tokens)
                 tree = parser.parse()
-                # Added "pairs" to the static check environment.
-                static_check(tree, {"wait": True, "require": True, "pairs": True})
+                static_check(tree, {"wait": True, "require": True, "pairs": True, "math": True, "table": True, "string": True})
                 self.current_interpreter = Interpreter(tree, output_callback=self.append_output)
                 self.current_interpreter.should_stop = False
                 self.current_interpreter.env['require'] = self.current_interpreter.builtin_require
@@ -1204,9 +1454,9 @@ class LuaIDE(tk.Tk):
         line_text = self.editor.get(line_start, f"{line_number}.end")
         indent_match = re.match(r'^(\s*)', line_text)
         indent = indent_match.group(1) if indent_match else ""
-        if re.search(r'\b(function|while|if|for)\b', line_text):
+        if re.search(r'\b(function|while|if|for|repeat)\b', line_text):
             next_line = self.editor.get(f"{line_number+1}.0", f"{line_number+1}.end")
-            if next_line.strip() != "end":
+            if next_line.strip() != "end" and next_line.strip() != "until":
                 new_indent = indent + "    "
                 self.editor.insert(tk.INSERT, "\n" + new_indent + "\n" + indent + "end")
                 self.editor.mark_set("insert", f"{line_number + 1}.{len(indent) + 4}")
@@ -1225,7 +1475,7 @@ class LuaIDE(tk.Tk):
             tokens = lexer.tokenize()
             parser = Parser(tokens)
             ast = parser.parse()
-            static_check(ast, {"wait": True, "require": True, "pairs": True})
+            static_check(ast, {"wait": True, "require": True, "pairs": True, "math": True, "table": True, "string": True})
         except Exception as e:
             err_msg = str(e)
             m = re.search(r'line (\d+)', err_msg)
