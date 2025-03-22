@@ -63,6 +63,7 @@ class Lexer:
             self.advance()
 
     def skip_comment(self):
+        # Skip until end of line (only supports '--' comments as in Lua)
         while self.current_char is not None and self.current_char != "\n":
             self.advance()
 
@@ -96,6 +97,23 @@ class Lexer:
 
     def get_next_token(self):
         while self.current_char is not None:
+            # Comments starting with '--'
+            if self.current_char == '-' and self.peek() == '-':
+                self.advance(); self.advance()
+                self.skip_comment()
+                continue
+            if self.current_char in " \t\r":
+                self.skip_whitespace()
+                continue
+            if self.current_char == "\n":
+                self.advance()
+                continue
+            if self.current_char.isdigit():
+                return self.number()
+            if self.current_char in ('"', "'"):
+                return self.string()
+            if self.current_char.isalpha() or self.current_char == '_':
+                return self.identifier()
             # Multi-character operators:
             if self.current_char == '~' and self.peek() == '=':
                 self.advance(); self.advance()
@@ -115,24 +133,8 @@ class Lexer:
             if self.current_char == '.' and self.peek() == '.':
                 self.advance(); self.advance()
                 return Token(TT_OP, '..', self.line)
-            if self.current_char in " \t\r":
-                self.skip_whitespace()
-                continue
-            if self.current_char == "\n":
-                self.advance()
-                continue
-            if self.current_char == '-' and self.peek() == '-':
-                self.advance(); self.advance()
-                self.skip_comment()
-                continue
-            if self.current_char.isdigit():
-                return self.number()
-            if self.current_char in ('"', "'"):
-                return self.string()
-            if self.current_char.isalpha() or self.current_char == '_':
-                return self.identifier()
-            # Added support for '[' and ']'
-            if self.current_char in "+-*/=(),<>{}.%^[]":
+            # Added support for '[' , ']', and '#' (as length operator) and '-' as operator.
+            if self.current_char in "+-*/=(),<>{}.%^#[]":
                 ch = self.current_char
                 self.advance()
                 return Token(TT_OP, ch, self.line)
@@ -185,6 +187,12 @@ class TableIndex(AST):
         self.table_expr = table_expr
         self.index_expr = index_expr
 
+# New AST node for unary operators (such as '-' and '#' for length)
+class UnaryOp(AST):
+    def __init__(self, op, expr):
+        self.op = op  # token containing operator
+        self.expr = expr
+
 # ForIn now holds a list of variables.
 class Var(AST):
     def __init__(self, name, line=None):
@@ -210,9 +218,12 @@ class BinOp(AST):
         self.op = op  # Token
         self.right = right
 
+# Modified Assignment to allow multiple variables on LHS and multiple expressions on RHS.
 class Assignment(AST):
     def __init__(self, left, expr, local=False):
-        self.left = left  # Var or TableAccess or TableIndex
+        # left: list of Var, TableAccess, or TableIndex nodes
+        # expr: list of expression nodes
+        self.left = left
         self.expr = expr
         self.local = local
 
@@ -387,18 +398,34 @@ class Parser:
         self.eat(TT_KEYWORD, 'end')
         return ForNumeric(Var(var_name), start_expr, end_expr, step_expr, block)
 
+    # New helper: parse a comma-separated list of variables
+    def varlist(self):
+        vars = [self.postfix_expr()]
+        while self.current_token.type == TT_OP and self.current_token.value == ',':
+            self.eat(TT_OP, ',')
+            vars.append(self.postfix_expr())
+        return vars
+
+    # New helper: parse a comma-separated list of expressions
+    def explist(self):
+        exps = [self.expr()]
+        while self.current_token.type == TT_OP and self.current_token.value == ',':
+            self.eat(TT_OP, ',')
+            exps.append(self.expr())
+        return exps
+
     def local_assignment(self):
         self.eat(TT_KEYWORD, 'local')
-        left = self.postfix_expr()
+        left = self.varlist()
         self.eat(TT_OP, '=')
-        expr = self.expr()
+        expr = self.explist()
         return Assignment(left, expr, local=True)
 
     def assignment(self):
-        left = self.postfix_expr()
+        left = self.varlist()
         self.eat(TT_OP, '=')
-        expr = self.expr()
-        return Assignment(left, expr)
+        expr = self.explist()
+        return Assignment(left, expr, local=False)
 
     def print_statement(self):
         self.eat(TT_KEYWORD, 'print')
@@ -471,7 +498,7 @@ class Parser:
                 body = self.statement_list()
                 self.eat(TT_KEYWORD, 'end')
                 func_literal = FunctionLiteral(params, Block(body))
-                return Assignment(TableAccess(Var(name), field), func_literal)
+                return Assignment([TableAccess(Var(name), field)], [func_literal])
             else:
                 self.eat(TT_OP, '(')
                 params = []
@@ -560,21 +587,45 @@ class Parser:
             node = BinOp(node, op, right)
         return node
 
-    def exponent_expr(self):
+    def term(self):
+        node = self.unary_expr()
+        while self.current_token.type == TT_OP and self.current_token.value in ('*', '/', '%', '//'):
+            op = self.current_token
+            self.eat(TT_OP, op.value)
+            right = self.unary_expr()
+            node = BinOp(node, op, right)
+        return node
+
+    # New production for unary expressions.
+    # For Lua, unary minus (-) has lower precedence than exponentiation,
+    # so when '-' is encountered, we call power_expr() to allow correct associativity.
+    def unary_expr(self):
+        if self.current_token.type == TT_KEYWORD and self.current_token.value == 'not':
+            op = self.current_token
+            self.eat(TT_KEYWORD, 'not')
+            expr = self.unary_expr()
+            return UnaryOp(op, expr)
+        elif self.current_token.type == TT_OP and self.current_token.value == '#':
+            op = self.current_token
+            self.eat(TT_OP, '#')
+            expr = self.unary_expr()
+            return UnaryOp(op, expr)
+        elif self.current_token.type == TT_OP and self.current_token.value == '-':
+            op = self.current_token
+            self.eat(TT_OP, '-')
+            expr = self.power_expr()
+            return UnaryOp(op, expr)
+        else:
+            return self.power_expr()
+
+    # New production for exponentiation expressions.
+    # Exponentiation (^) is right-associative.
+    def power_expr(self):
         node = self.postfix_expr()
         if self.current_token.type == TT_OP and self.current_token.value == '^':
             op = self.current_token
             self.eat(TT_OP, '^')
-            right = self.exponent_expr()
-            node = BinOp(node, op, right)
-        return node
-
-    def term(self):
-        node = self.exponent_expr()
-        while self.current_token.type == TT_OP and self.current_token.value in ('*', '/', '%', '//'):
-            op = self.current_token
-            self.eat(TT_OP, op.value)
-            right = self.exponent_expr()
+            right = self.unary_expr()  # right-associative
             node = BinOp(node, op, right)
         return node
 
@@ -596,7 +647,6 @@ class Parser:
                 field = self.current_token.value
                 self.eat(TT_IDENT)
                 node = TableAccess(node, field)
-            # Added support for dynamic table indexing: table[expr]
             elif self.current_token.type == TT_OP and self.current_token.value == '[':
                 self.eat(TT_OP, '[')
                 index_expr = self.expr()
@@ -684,13 +734,13 @@ def static_check(node, env):
         for stmt in node.statements:
             static_check(stmt, env)
     elif isinstance(node, Assignment):
-        static_check(node.expr, env)
-        if isinstance(node.left, Var):
-            env[node.left.name] = True
-        elif isinstance(node.left, (TableAccess, TableIndex)):
-            static_check(node.left, env)
-        else:
-            static_check(node.left, env)
+        for exp in node.expr:
+            static_check(exp, env)
+        for left_item in node.left:
+            if isinstance(left_item, Var):
+                env[left_item.name] = True
+            else:
+                static_check(left_item, env)
     elif isinstance(node, Var):
         if node.name not in env:
             raise UndefinedVarException(node.line, f"Undefined variable: {node.name}")
@@ -754,27 +804,15 @@ def static_check(node, env):
         static_check(node.index_expr, env)
     elif isinstance(node, Not):
         static_check(node.expr, env)
+    elif isinstance(node, UnaryOp):
+        static_check(node.expr, env)
     elif isinstance(node, Nil):
         pass
     # Numbers, Strings, Booleans: nothing to check.
 
 #######################
-# Interpreter and Built-in Functions
+# Built-in functions for additional Lua features
 #######################
-class ReturnException(Exception):
-    def __init__(self, value):
-        self.value = value
-
-class BreakException(Exception):
-    pass
-
-class UserFunction:
-    def __init__(self, params, body, env):
-        self.params = params
-        self.body = body
-        self.env = env.copy()
-
-# Math library built-in functions for Lua-like math module
 def math_random(*args):
     if len(args) == 0:
         return random.random()
@@ -788,22 +826,25 @@ def math_random(*args):
 def math_randomseed(x):
     random.seed(x)
 
-# Table library built-in functions
 def table_insert(tbl, value, pos=None):
     if not isinstance(tbl, dict):
         raise Exception("table.insert expects a table")
+    if pos is not None:
+        if isinstance(pos, float) and pos.is_integer():
+            pos = int(pos)
+        elif not isinstance(pos, int):
+            raise Exception("table.insert position must be an integer")
     if pos is None:
         indices = [k for k in tbl.keys() if isinstance(k, int)]
         pos = max(indices) + 1 if indices else 1
         tbl[pos] = value
     else:
-        if not isinstance(pos, int):
-            raise Exception("table.insert position must be an integer")
         indices = [k for k in tbl.keys() if isinstance(k, int)]
         max_index = max(indices) if indices else 0
         for i in range(max_index, pos - 1, -1):
             tbl[i+1] = tbl.get(i)
         tbl[pos] = value
+
 
 def table_remove(tbl, pos=None):
     if not isinstance(tbl, dict):
@@ -835,7 +876,6 @@ def table_concat(tbl, sep=""):
             result += sep
     return result
 
-# String library built-in functions
 def string_len(s):
     if not isinstance(s, str):
         raise Exception("string.len expects a string")
@@ -859,15 +899,75 @@ def string_lower(s):
         raise Exception("string.lower expects a string")
     return s.lower()
 
+# Built-in select: returns the count or a list of varargs starting from a given index (Lua indices start at 1)
+def builtin_select(first, *args):
+    if first == "#":
+        return len(args)
+    else:
+        try:
+            n = int(first)
+        except:
+            raise Exception("select expects a number or '#' as the first argument")
+        if n < 1 or n > len(args) + 1:
+            return ()  # In Lua, if n is out of bounds, it returns nothing
+        return args[n-1:]
+
+# Additional built-in: type, tostring, tonumber
+def builtin_type(val):
+    if val is None:
+        return "nil"
+    elif isinstance(val, bool):
+        return "boolean"
+    elif isinstance(val, (int, float)):
+        return "number"
+    elif isinstance(val, str):
+        return "string"
+    elif isinstance(val, dict):
+        return "table"
+    elif callable(val):
+        return "function"
+    else:
+        return "userdata"
+
+def builtin_tostring(val):
+    return str(val)
+
+def builtin_tonumber(val):
+    try:
+        return float(val)
+    except:
+        return None
+
+class ReturnException(Exception):
+    def __init__(self, value):
+        self.value = value
+
+class BreakException(Exception):
+    pass
+
+class UserFunction:
+    def __init__(self, params, body, env):
+        self.params = params
+        self.body = body
+        self.env = env.copy()
+
+#######################
+# Interpreter and Built-in Functions
+#######################
 class Interpreter:
     def __init__(self, tree, output_callback=print):
         self.tree = tree
         self.env = {}
         self.output_callback = output_callback
         self.should_stop = False
+        # Built-in functions and libraries
         self.env['wait'] = self.builtin_wait
         self.env['require'] = self.builtin_require
         self.env['pairs'] = self.builtin_pairs
+        self.env['select'] = builtin_select
+        self.env['type'] = builtin_type
+        self.env['tostring'] = builtin_tostring
+        self.env['tonumber'] = builtin_tonumber
         self.env['math'] = {
             'abs': abs,
             'acos': math.acos,
@@ -1017,67 +1117,98 @@ class Interpreter:
     def visit_TableIndex(self, node):
         table = self.visit(node.table_expr)
         index = self.visit(node.index_expr)
-        try:
-            return table[index]
-        except Exception:
-            self.error(f"Index '{index}' not found in table")
+        if isinstance(table, dict):
+            return table.get(index, None)
+        else:
+            self.error("Attempt to index a non-table value")
 
     def visit_Not(self, node):
         return not self.visit(node.expr)
 
-    def visit_BinOp(self, node):
-        left = self.visit(node.left)
-        right = self.visit(node.right)
-        op = node.op.value
-        if op == '+':
-            return left + right
-        elif op == '-':
-            return left - right
-        elif op == '*':
-            return left * right
-        elif op == '/':
-            return left / right
-        elif op == '%':
-            return left % right
-        elif op == '//':
-            return left // right
-        elif op == '^':
-            return left ** right
-        elif op == '<':
-            return left < right
-        elif op == '>':
-            return left > right
-        elif op == '<=':
-            return left <= right
-        elif op == '>=':
-            return left >= right
-        elif op == '==':
-            return left == right
-        elif op == '~=':
-            return left != right
-        elif op == '..':
-            return str(left) + str(right)
-        elif op == 'and':
-            return left and right
-        elif op == 'or':
-            return left or right
+    def visit_UnaryOp(self, node):
+        operand = self.visit(node.expr)
+        if node.op.value == '-':
+            return -operand
+        elif node.op.value == '#':
+            if isinstance(operand, str):
+                return len(operand)
+            elif isinstance(operand, dict):
+                count = 0
+                while (count + 1) in operand:
+                    count += 1
+                return count
+            else:
+                self.error("Operator '#' not defined for this type")
+        elif node.op.value == 'not':
+            return not operand
         else:
-            self.error(f"Unknown binary operator {op}")
+            self.error(f"Unknown unary operator {node.op.value}")
+
+    def visit_BinOp(self, node):
+        op = node.op.value
+        if op == 'and':
+            left = self.visit(node.left)
+            if not left:
+                return left
+            return self.visit(node.right)
+        elif op == 'or':
+            left = self.visit(node.left)
+            if left:
+                return left
+            return self.visit(node.right)
+        else:
+            left = self.visit(node.left)
+            right = self.visit(node.right)
+            if op == '+':
+                return left + right
+            elif op == '-':
+                return left - right
+            elif op == '*':
+                return left * right
+            elif op == '/':
+                return left / right
+            elif op == '%':
+                return left % right
+            elif op == '//':
+                return left // right
+            elif op == '^':
+                return left ** right
+            elif op == '<':
+                return left < right
+            elif op == '>':
+                return left > right
+            elif op == '<=':
+                return left <= right
+            elif op == '>=':
+                return left >= right
+            elif op == '==':
+                return left == right
+            elif op == '~=':
+                return left != right
+            elif op == '..':
+                return str(left) + str(right)
+            else:
+                self.error(f"Unknown binary operator {op}")
 
     def visit_Assignment(self, node):
-        val = self.visit(node.expr)
-        if isinstance(node.left, Var):
-            self.env[node.left.name] = val
-        elif isinstance(node.left, (TableAccess, TableIndex)):
-            target = self.visit(node.left.table_expr)
-            if isinstance(node.left, TableAccess):
-                target[node.left.field] = val
+        values = [self.visit(exp) for exp in node.expr]
+        # Fill missing values with nil (None) if there are fewer expressions than variables
+        if len(values) < len(node.left):
+            values.extend([None] * (len(node.left) - len(values)))
+        # If there are more expressions than variables, ignore extras
+        for var_node, value in zip(node.left, values):
+            if isinstance(var_node, Var):
+                self.env[var_node.name] = value
+            elif isinstance(var_node, TableAccess):
+                target = self.visit(var_node.table_expr)
+                target[var_node.field] = value
+            elif isinstance(var_node, TableIndex):
+                target = self.visit(var_node.table_expr)
+                index = self.visit(var_node.index_expr)
+                target[index] = value
             else:
-                index = self.visit(node.left.index_expr)
-                target[index] = val
-        else:
-            self.error("Invalid assignment target")
-        return val
+                self.error("Invalid assignment target")
+        return values[-1] if values else None
 
     def visit_Print(self, node):
         val = self.visit(node.expr)
@@ -1201,7 +1332,7 @@ class LuaIDE(tk.Tk):
         self.geometry("900x700")
         self.configure(bg="#21252B")
 
-        self.completion_words = list(KEYWORDS) + ['wait', 'require', 'pairs', 'math', 'table', 'string']
+        self.completion_words = list(KEYWORDS) + ['wait', 'require', 'pairs', 'select', 'type', 'tostring', 'tonumber', 'math', 'table', 'string']
         self.completion_box = None
         self.current_interpreter = None
         self.run_thread = None
@@ -1218,7 +1349,8 @@ class LuaIDE(tk.Tk):
                                      undo=True, wrap=tk.NONE)
         self.editor.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         sample = (
-            "-- UPDATE 2.0.0 --\n"
+            "-- UPDATE 2.5.0 --\n"
+            "-- This is a comment using '--' as in real Lua\n"
             "local e = { name = \"hero\", attack = function(self) -- Performs an attack\n"
             "    print(self.name .. \" attacks!\")\n"
             "    return 10\n"
@@ -1239,6 +1371,13 @@ class LuaIDE(tk.Tk):
             "end\n\n"
             "local damage = e.attack(e)\n"
             "print(\"Damage dealt: \" .. double(damage))\n\n"
+            "-- Multiple assignment example:\n"
+            "local x, y = 1, 2\n"
+            "print(\"x: \" .. x .. \", y: \" .. y)\n\n"
+            "-- select() example:\n"
+            "print(\"Number of extra arguments: \" .. select(\"#\", 10, 20, 30))\n"
+            "local extras = {select(2, 10, 20, 30)}\n"
+            "print(\"Extras: \" .. table.concat(extras, \",\"))\n\n"
             "-- Numeric for loop example:\n"
             "for i = 1, 5, 1 do\n"
             "    print(i)\n"
@@ -1273,6 +1412,9 @@ class LuaIDE(tk.Tk):
             "print(\"Value at key 'c': \" .. t[\"c\"])\n"
             "t[\"d\"] = 4\n"
             "print(\"Value at key 'd': \" .. t[\"d\"])\n\n"
+            "-- Negative number and exponentiation example:\n"
+            "print(\"-2^2 should be -4: \" .. -2^2)  -- parsed as -(2^2) prints -4\n"
+            "print(\"(-2)^2 should be 4: \" .. (-2)^2)  -- prints 4\n\n"
             "-- Operators examples:\n"
             "-- Exponentiation: local exp = 2 ^ 3\n"
             "-- Floor division: local flDiv = 10 // 3\n"
@@ -1300,12 +1442,14 @@ class LuaIDE(tk.Tk):
         self.setup_tags()
 
     def setup_tags(self):
-        self.editor.tag_configure("keyword", foreground="#61AFEF")
+        self.editor.tag_configure("keyword", foreground="#C678DD")
         self.editor.tag_configure("string", foreground="#98C379")
         self.editor.tag_configure("number", foreground="#D19A66")
-        self.editor.tag_configure("comment", foreground="#5C6370")
-        self.editor.tag_configure("error", underline=True, foreground="red")
-        self.editor.tag_configure("undefined", underline=True, foreground="blue")
+        self.editor.tag_configure("boolean", foreground="#E5C07B")
+        self.editor.tag_configure("comment", foreground="#7F848E", font=("Consolas", 14, "italic"))
+        self.editor.tag_configure("operator", foreground="#56B6C2")
+        self.editor.tag_configure("error", underline=True, foreground="#FF5555")
+        self.editor.tag_configure("undefined", underline=True, foreground="#61AFEF")
 
     def clear_editor(self):
         self.editor.delete(1.0, tk.END)
@@ -1323,7 +1467,7 @@ class LuaIDE(tk.Tk):
         self.output.see(tk.END)
 
     def run_code(self):
-        code = self.editor.get("1.0", tk.END)
+        code = self.editor.get(1.0, tk.END)
         self.output.delete(1.0, tk.END)
         def run_interpreter():
             try:
@@ -1331,7 +1475,7 @@ class LuaIDE(tk.Tk):
                 tokens = lexer.tokenize()
                 parser = Parser(tokens)
                 tree = parser.parse()
-                static_check(tree, {"wait": True, "require": True, "pairs": True, "math": True, "table": True, "string": True})
+                static_check(tree, {"wait": True, "require": True, "pairs": True, "select": True, "type": True, "tostring": True, "tonumber": True, "math": True, "table": True, "string": True})
                 self.current_interpreter = Interpreter(tree, output_callback=self.append_output)
                 self.current_interpreter.should_stop = False
                 self.current_interpreter.env['require'] = self.current_interpreter.builtin_require
@@ -1355,7 +1499,9 @@ class LuaIDE(tk.Tk):
         self.editor.tag_remove("keyword", "1.0", tk.END)
         self.editor.tag_remove("string", "1.0", tk.END)
         self.editor.tag_remove("number", "1.0", tk.END)
+        self.editor.tag_remove("boolean", "1.0", tk.END)
         self.editor.tag_remove("comment", "1.0", tk.END)
+        self.editor.tag_remove("operator", "1.0", tk.END)
         for kw in KEYWORDS:
             start = "1.0"
             while True:
@@ -1365,6 +1511,10 @@ class LuaIDE(tk.Tk):
                 end = f"{pos}+{len(kw)}c"
                 self.editor.tag_add("keyword", pos, end)
                 start = end
+        for match in re.finditer(r'\b(true|false|nil)\b', content):
+            start_index = self.index_from_pos(match.start())
+            end_index = self.index_from_pos(match.end())
+            self.editor.tag_add("boolean", start_index, end_index)
         for match in re.finditer(r'(\".*?\"|\'.*?\')', content):
             start_index = self.index_from_pos(match.start())
             end_index = self.index_from_pos(match.end())
@@ -1377,6 +1527,10 @@ class LuaIDE(tk.Tk):
             start_index = self.index_from_pos(match.start())
             end_index = self.index_from_pos(match.end())
             self.editor.tag_add("comment", start_index, end_index)
+        for match in re.finditer(r'(\+|\-|\*|\/|==|~=|<=|>=|<|>|\^|%|\/\/|\.\.)', content):
+            start_index = self.index_from_pos(match.start())
+            end_index = self.index_from_pos(match.end())
+            self.editor.tag_add("operator", start_index, end_index)
 
     def index_from_pos(self, pos):
         return "1.0+%dc" % pos
@@ -1475,7 +1629,7 @@ class LuaIDE(tk.Tk):
             tokens = lexer.tokenize()
             parser = Parser(tokens)
             ast = parser.parse()
-            static_check(ast, {"wait": True, "require": True, "pairs": True, "math": True, "table": True, "string": True})
+            static_check(ast, {"wait": True, "require": True, "pairs": True, "select": True, "type": True, "tostring": True, "tonumber": True, "math": True, "table": True, "string": True})
         except Exception as e:
             err_msg = str(e)
             m = re.search(r'line (\d+)', err_msg)
