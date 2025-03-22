@@ -824,6 +824,7 @@ def static_check(node, env):
 #######################
 # Built-in functions for additional Lua features
 #######################
+# --- Math Library Extensions ---
 def math_random(*args):
     if len(args) == 0:
         return random.random()
@@ -837,6 +838,7 @@ def math_random(*args):
 def math_randomseed(x):
     random.seed(x)
 
+# --- Table Library Extensions ---
 def table_insert(tbl, value, pos=None):
     if not isinstance(tbl, dict):
         raise Exception("table.insert expects a table")
@@ -886,6 +888,7 @@ def table_concat(tbl, sep=""):
             result += sep
     return result
 
+# --- String Library Extensions ---
 def string_len(s):
     if not isinstance(s, str):
         raise Exception("string.len expects a string")
@@ -909,6 +912,62 @@ def string_lower(s):
         raise Exception("string.lower expects a string")
     return s.lower()
 
+def string_char(*args):
+    try:
+        return ''.join(chr(int(x)) for x in args)
+    except Exception as e:
+        raise Exception("string.char error: " + str(e))
+
+def string_byte(s, i=1, j=None):
+    if not isinstance(s, str):
+        raise Exception("string.byte expects a string")
+    if j is None:
+        pos = i - 1
+        if pos < 0 or pos >= len(s):
+            return None
+        return ord(s[pos])
+    else:
+        start = i - 1
+        end = j
+        return [ord(ch) for ch in s[start:end]]
+
+def string_reverse(s):
+    if not isinstance(s, str):
+        raise Exception("string.reverse expects a string")
+    return s[::-1]
+
+def string_rep(s, n):
+    if not isinstance(s, str):
+        raise Exception("string.rep expects a string")
+    try:
+        n = int(n)
+    except:
+        raise Exception("string.rep expects an integer as second argument")
+    return s * n
+
+def string_find(s, pattern, init=1):
+    if not isinstance(s, str):
+        raise Exception("string.find expects a string")
+    pos = s.find(pattern, init - 1)
+    if pos == -1:
+        return None
+    else:
+        return (pos + 1, pos + len(pattern))
+
+def string_format(fmt, *args):
+    try:
+        return fmt % args
+    except Exception as e:
+        raise Exception("string.format error: " + str(e))
+
+def string_gsub(s, pattern, repl, n=-1):
+    if not isinstance(s, str):
+        raise Exception("string.gsub expects a string")
+    count = 0 if n < 0 else n
+    result, num = re.subn(pattern, repl, s, count=count)
+    return result, num
+
+# --- Built-in Functions ---
 def builtin_select(first, *args):
     if first == "#":
         return len(args)
@@ -998,7 +1057,9 @@ class Interpreter:
             'tan': math.tan,
             'tanh': math.tanh,
             'random': math_random,
-            'randomseed': math_randomseed
+            'randomseed': math_randomseed,
+            'modf': math.modf,
+            'pow': math.pow
         }
         self.env['table'] = {
             'insert': table_insert,
@@ -1009,7 +1070,14 @@ class Interpreter:
             'len': string_len,
             'sub': string_sub,
             'upper': string_upper,
-            'lower': string_lower
+            'lower': string_lower,
+            'char': string_char,
+            'byte': string_byte,
+            'reverse': string_reverse,
+            'rep': string_rep,
+            'find': string_find,
+            'format': string_format,
+            'gsub': string_gsub
         }
 
     def builtin_wait(self, t):
@@ -1117,9 +1185,18 @@ class Interpreter:
     def visit_TableAccess(self, node):
         table = self.visit(node.table_expr)
         field = node.field
-        if field in table:
-            return table[field]
-        self.error(f"Field '{field}' not found in table")
+        if isinstance(table, dict):
+            if field in table:
+                return table[field]
+            self.error(f"Field '{field}' not found in table")
+        elif isinstance(table, str):
+            # Support method call on strings using the built-in string library.
+            string_lib = self.env.get('string', {})
+            if field in string_lib:
+                return lambda *args: string_lib[field](table, *args)
+            self.error(f"Method '{field}' not found for string")
+        else:
+            self.error(f"Cannot access field '{field}' of non-table and non-string value")
 
     def visit_TableIndex(self, node):
         table = self.visit(node.table_expr)
@@ -1354,7 +1431,7 @@ class LuaIDE(tk.Tk):
                                      undo=True, wrap=tk.NONE)
         self.editor.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         sample = (
-            "-- UPDATE 2.5.1 --\n"
+            "-- UPDATE 2.7.1 --\n"
             "-- This is a comment using '--' as in real Lua\n"
             "local e = { name = \"hero\", attack = function(self) -- Performs an attack\n"
             "    print(self.name .. \" attacks!\")\n"
@@ -1413,7 +1490,11 @@ class LuaIDE(tk.Tk):
             "-- String library examples:\n"
             "print(\"Length of 'hello' is \" .. string.len(\"hello\"))\n"
             "print(\"Uppercase: \" .. string.upper(\"hello\"))\n"
-            "print(\"Substring: \" .. string.sub(\"hello\", 2, 4))\n\n"
+            "print(\"Substring: \" .. string.sub(\"hello\", 2, 4))\n"
+            "print(\"Character from code 97: \" .. string.char(97))\n"
+            "print(\"Byte value of first char: \" .. string.byte(\"hello\"))\n"
+            "print(\"Reverse of 'hello': \" .. string.reverse(\"hello\"))\n"
+            "print(\"Repeat 'ha' 3 times: \" .. string.rep(\"ha\", 3))\n\n"
             "-- Table indexing examples:\n"
             "local t = { a = 1, b = 2, [\"c\"] = 3 }\n"
             "print(\"Value at key 'c': \" .. t[\"c\"])\n"
