@@ -8,6 +8,7 @@ import math
 import random
 import sys
 from functools import cmp_to_key
+import importlib  # Added for pyrequire support
 
 #######################
 # Extra Math Functions
@@ -24,56 +25,37 @@ def map_value(x, inmin, inmax, outmin, outmax):
 def sign(x):
     return -1 if x < 0 else (1 if x > 0 else 0)
 
-import math
-import random
-
-# Gradient vectors
+# Gradient vectors for noise
 gradients = [(1,1,0), (-1,1,0), (1,-1,0), (-1,-1,0),
              (1,0,1), (-1,0,1), (1,0,-1), (-1,0,-1),
              (0,1,1), (0,-1,1), (0,1,-1), (0,-1,-1)]
-
-# Permutation table (repeated to avoid overflow)
 p = [i for i in range(256)]
 random.shuffle(p)
 p = p * 2
 
 def fade(t):
-    """Fade function to smooth the interpolation."""
     return t * t * t * (t * (t * 6 - 15) + 10)
 
-
-
 def grad(hash, x, y, z):
-    """Calculates the gradient vector dot product."""
     g = gradients[hash % 12]
     return g[0] * x + g[1] * y + g[2] * z
 
 def noise(x, y, z):
-    """Generates Perlin noise for the given x, y, z coordinates."""
-    # Determine unit cube containing the point
     X = int(math.floor(x)) & 255
     Y = int(math.floor(y)) & 255
     Z = int(math.floor(z)) & 255
-
-    # Find relative x, y, z of the point in the cube
     x -= math.floor(x)
     y -= math.floor(y)
     z -= math.floor(z)
-
-    # Compute fade curves for each of x, y, z
     u = fade(x)
     v = fade(y)
     w = fade(z)
-
-    # Hash coordinates of the cube corners
     A  = p[X] + Y
     AA = p[A] + Z
     AB = p[A + 1] + Z
     B  = p[X + 1] + Y
     BA = p[B] + Z
     BB = p[B + 1] + Z
-
-    # Add blended results from the corners of the cube
     return lerp(w,
         lerp(v,
             lerp(u, grad(p[AA], x, y, z), grad(p[BA], x - 1, y, z)),
@@ -86,7 +68,6 @@ def noise(x, y, z):
     )
 
 def cbrt(x):
-    # Cube root function.
     return x ** (1 / 3) if x >= 0 else -((-x) ** (1 / 3))
 
 #######################
@@ -97,7 +78,7 @@ from types import FunctionType
 def task_spawn(func, *args):
     def wrapper():
         if hasattr(func, '__class__') and func.__class__.__name__ == "UserFunction":
-            interpreter = _game_state.get('interpreter')
+            interpreter = _state.get('interpreter')
             if interpreter is None:
                 raise Exception("No interpreter available for task.spawn for UserFunction")
             interpreter.call_function(func, *args)
@@ -110,7 +91,7 @@ def task_spawn(func, *args):
 def task_defer(func, *args):
     def wrapper():
         if hasattr(func, '__class__') and func.__class__.__name__ == "UserFunction":
-            interpreter = _game_state.get('interpreter')
+            interpreter = _state.get('interpreter')
             if interpreter is None:
                 raise Exception("No interpreter available for task.defer for UserFunction")
             interpreter.call_function(func, *args)
@@ -123,7 +104,7 @@ def task_defer(func, *args):
 def task_delay(duration, func, *args):
     def wrapper():
         if hasattr(func, '__class__') and func.__class__.__name__ == "UserFunction":
-            interpreter = _game_state.get('interpreter')
+            interpreter = _state.get('interpreter')
             if interpreter is None:
                 raise Exception("No interpreter available for task.delay for UserFunction")
             interpreter.call_function(func, *args)
@@ -134,11 +115,9 @@ def task_delay(duration, func, *args):
     return t
 
 def task_desynchronize():
-    # No-op in this simple interpreter.
     pass
 
 def task_synchronize():
-    # No-op in this simple interpreter.
     pass
 
 def task_wait(duration):
@@ -360,6 +339,11 @@ class UnaryOp(AST):
         self.op = op
         self.expr = expr
 
+# The Not node is retained for explicit "not" usage (handled only in unary_expr now)
+class Not(AST):
+    def __init__(self, expr):
+        self.expr = expr
+
 class Var(AST):
     def __init__(self, name, line=None):
         self.name = name
@@ -373,10 +357,6 @@ class TableAccess(AST):
     def __init__(self, table_expr, field):
         self.table_expr = table_expr
         self.field = field
-
-class Not(AST):
-    def __init__(self, expr):
-        self.expr = expr
 
 class BinOp(AST):
     def __init__(self, left, op, right):
@@ -488,7 +468,6 @@ class Parser:
     def statement(self):
         if self.current_token.type == TT_KEYWORD:
             if self.current_token.value == 'local':
-                # Support local function definitions: if next token is 'function', call local_function_def
                 if self.tokens[self.pos+1].type == TT_KEYWORD and self.tokens[self.pos+1].value == 'function':
                     return self.local_function_def()
                 else:
@@ -529,7 +508,6 @@ class Parser:
         self.error(f"Unexpected token: {self.current_token}")
 
     def local_function_def(self):
-        # Parse "local function function_name(...)" syntax
         self.eat(TT_KEYWORD, 'local')
         self.eat(TT_KEYWORD, 'function')
         if self.current_token.type == TT_IDENT:
@@ -547,7 +525,6 @@ class Parser:
             self.eat(TT_OP, ')')
             body = self.statement_list()
             self.eat(TT_KEYWORD, 'end')
-            # Return a local assignment with a function literal.
             return Assignment([Var(name)], [FunctionLiteral(params, Block(body))], local=True)
         else:
             self.error("Expected function name after 'local function'")
@@ -880,10 +857,7 @@ class Parser:
         elif tok.type == TT_KEYWORD and tok.value == 'nil':
             self.eat(TT_KEYWORD, 'nil')
             return Nil()
-        elif tok.type == TT_KEYWORD and tok.value == 'not':
-            self.eat(TT_KEYWORD, 'not')
-            expr = self.primary_expr()
-            return Not(expr)
+        # Removed duplicate handling of "not" here; it is now solely handled in unary_expr.
         elif tok.type == TT_KEYWORD and tok.value == 'function':
             return self.function_literal()
         elif tok.type == TT_IDENT:
@@ -946,8 +920,6 @@ def static_check(node, env):
             static_check(exp, env)
         for left_item in node.left:
             if isinstance(left_item, Var):
-                # Here, if the assignment is not local and the variable is not already defined,
-                # we enforce that it must have been defined earlier.
                 if not node.local and left_item.name not in env:
                     raise UndefinedVarException(left_item.line, f"Variable '{left_item.name}' is not defined; use local to define new variables")
                 env[left_item.name] = True
@@ -1124,14 +1096,6 @@ def table_sort(t, comp=None):
         t[i] = sorted_arr[i - 1]
     return None
 
-def table_unpack(t, i=1, j=None):
-    if not isinstance(t, dict):
-        raise Exception("table.unpack expects a table")
-    if j is None:
-        j = table_maxn(t)
-    return tuple(t.get(k) for k in range(int(i), int(j) + 1))
-
-# Modified table_insert: now converts pos to int if possible.
 def table_insert(tbl, value, pos=None):
     if not isinstance(tbl, dict):
         raise Exception("table.insert expects a table")
@@ -1170,9 +1134,19 @@ def table_remove(tbl, pos=None):
         del tbl[max_index]
     return value
 
+def table_unpack(t, i=1, j=None):
+    if not isinstance(t, dict):
+        raise Exception("table.unpack expects a table")
+    if j is None:
+        j = table_maxn(t)
+    return tuple(t.get(k) for k in range(int(i), int(j) + 1))
+
 def table_concat_original(tbl, sep=""):
     return table_concat(tbl, sep)
 
+#######################
+# String Library Extensions
+#######################
 def string_len(s):
     if not isinstance(s, str):
         raise Exception("string.len expects a string")
@@ -1181,6 +1155,11 @@ def string_len(s):
 def string_sub(s, i, j=None):
     if not isinstance(s, str):
         raise Exception("string.sub expects a string")
+    length = len(s)
+    if i < 0:
+        i = length + i + 1
+    if j is not None and j < 0:
+        j = length + j + 1
     if j is None:
         return s[i - 1:]
     else:
@@ -1288,6 +1267,19 @@ def builtin_tonumber(val):
     except:
         return None
 
+def builtin_ipairs(tbl):
+    if not isinstance(tbl, dict):
+        raise Exception("ipairs expects a table")
+    result = []
+    i = 1
+    while i in tbl:
+        result.append((i, tbl[i]))
+        i += 1
+    return result
+
+#######################
+# Exceptions and User Function
+#######################
 class ReturnException(Exception):
     def __init__(self, value):
         self.value = value
@@ -1302,84 +1294,22 @@ class UserFunction:
         self.env = env.copy()
 
 #######################
-# Game Library Extensions
+# (Game Library Extensions Removed)
 #######################
-_game_state = {}
+# Note: All game and turtle-related functions and variables have been removed.
 
-def game_create_window(width, height, title):
-    win = tk.Toplevel()
-    win.title(str(title))
-    win.geometry(f"{int(width)}x{int(height)}")
-    canvas = tk.Canvas(win, width=int(width), height=int(height), bg="black")
-    canvas.pack()
-    win.focus_set()
-    _game_state['window'] = win
-    _game_state['canvas'] = canvas
-    _game_state['last_update'] = time.time()
-    return None
+# _state will serve as a global dictionary for interpreter state
+_state = {}
 
-def game_clear(color):
-    canvas = _game_state.get('canvas')
-    if canvas is None:
-        raise Exception("No game window created. Call game.create_window first.")
-    canvas.delete("all")
-    canvas.config(bg=str(color))
-    return None
-
-def game_draw_rect(x, y, width, height, color):
-    canvas = _game_state.get('canvas')
-    if canvas is None:
-        raise Exception("No game window created. Call game.create_window first.")
-    canvas.create_rectangle(float(x), float(y), float(x) + float(width), float(y) + float(height), fill=str(color), outline=str(color))
-    return None
-
-def game_draw_line(x1, y1, x2, y2, color):
-    canvas = _game_state.get('canvas')
-    if canvas is None:
-        raise Exception("No game window created. Call game.create_window first.")
-    canvas.create_line(float(x1), float(y1), float(x2), float(y2), fill=str(color))
-    return None
-
-def game_draw_polygon(*args):
-    canvas = _game_state.get('canvas')
-    if canvas is None:
-        raise Exception("No game window created. Call game.create_window first.")
-    if len(args) < 7:
-        raise Exception("game.draw_polygon requires at least 7 arguments: at least 3 pairs of coordinates and a color")
-    color = args[-1]
-    points = [float(val) for val in args[:-1]]
-    if len(points) % 2 != 0:
-        raise Exception("Coordinates must be provided in pairs")
-    canvas.create_polygon(points, fill=str(color), outline=str(color))
-    return None
-
-def game_update():
-    win = _game_state.get('window')
-    if win is None:
-        raise Exception("No game window created. Call game.create_window first.")
-    _game_state['last_update'] = time.time()
-    win.update_idletasks()
-    win.update()
-    return None
-
-def game_set_key_handler(callback):
-    win = _game_state.get('window')
-    if win is None:
-        raise Exception("No game window created. Call game.create_window first.")
-    _game_state['key_handler'] = callback
-    def game_key_event(event):
-        try:
-            if isinstance(_game_state.get('key_handler'), UserFunction):
-                interpreter = _game_state.get('interpreter')
-                if interpreter is None:
-                    raise Exception("No interpreter available for callback")
-                interpreter.call_function(_game_state['key_handler'], event.char)
-            else:
-                _game_state['key_handler'](event.char)
-        except Exception as e:
-            print("Error in key handler:", e)
-    win.bind("<KeyPress>", game_key_event)
-    return None
+#######################
+# Custom Python Module Loader (pyrequire)
+#######################
+def pyrequire(module_name):
+    try:
+        mod = importlib.import_module(module_name)
+        return mod.__dict__
+    except Exception as e:
+        raise Exception("pyrequire failed: " + str(e))
 
 #######################
 # Interpreter and Built-in Functions
@@ -1394,7 +1324,6 @@ def math_random(*args):
     else:
         raise Exception("math.random expects 0, 1, or 2 arguments")
 
-
 def math_randomseed(x):
     random.seed(x)
 
@@ -1406,6 +1335,7 @@ class Interpreter:
         self.should_stop = False
         self.env['wait'] = self.builtin_wait
         self.env['require'] = self.builtin_require
+        self.env['pyrequire'] = pyrequire  # Added pyrequire to environment
         self.env['pairs'] = self.builtin_pairs
         self.env['ipairs'] = builtin_ipairs
         self.env['select'] = builtin_select
@@ -1493,16 +1423,7 @@ class Interpreter:
             'difftime': os_difftime,
             'time': os_time
         }
-        self.env['game'] = {
-            'create_window': game_create_window,
-            'clear': game_clear,
-            'draw_rect': game_draw_rect,
-            'draw_line': game_draw_line,
-            'draw_polygon': game_draw_polygon,
-            'update': game_update,
-            'set_key_handler': game_set_key_handler,
-        }
-        _game_state['interpreter'] = self
+        _state['interpreter'] = self
         self.start_time = time.time()
 
     def check_timeout(self):
@@ -1727,7 +1648,6 @@ class Interpreter:
             values.extend([None] * (len(node.left) - len(values)))
         for var_node, value in zip(node.left, values):
             if isinstance(var_node, Var):
-                # Enforce that new variables must be defined with local
                 if not node.local and var_node.name not in self.env:
                     self.error("Variable '" + var_node.name + "' is not defined; use local to define new variables")
                 self.env[var_node.name] = value
@@ -1864,8 +1784,9 @@ class LuaIDE(tk.Tk):
         self.geometry("900x700")
         self.configure(bg="#21252B")
 
-        self.completion_words = list(KEYWORDS) + ['wait', 'require', 'pairs', 'ipairs', 'select', 'type', 'tostring',
-                                                  'tonumber', 'math', 'table', 'string', 'game', 'task', 'os']
+        # Removed "game" from completion words
+        self.completion_words = list(KEYWORDS) + ['wait', 'require', 'pyrequire', 'pairs', 'ipairs', 'select', 'type', 'tostring',
+                                                  'tonumber', 'math', 'table', 'string', 'task', 'os']
         self.completion_box = None
         self.current_interpreter = None
         self.run_thread = None
@@ -1882,7 +1803,8 @@ class LuaIDE(tk.Tk):
                                    undo=True, wrap=tk.NONE)
         self.editor.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         sample = (
-            "-- UPDATE 3.0.0 --\n"
+            "-- UPDATE 4.0.0 --\n"
+            "-- Ask gpt for help if needed -- \n"
             "-- This is a comment using '--' as in real Lua\n"
             "local e = { name = \"hero\", attack = function(self) -- Performs an attack\n"
             "    print(self.name .. \" attacks!\")\n"
@@ -1951,16 +1873,11 @@ class LuaIDE(tk.Tk):
             "print(\"os.date: \" .. os.date(\"%Y-%m-%d %H:%M:%S\"))\n"
             "print(\"os.difftime: \" .. os.difftime(os.time(), 0))\n"
             "print(\"os.time: \" .. os.time())\n\n"
-            "-- Game Library Examples:\n"
-            "game.create_window(400, 300, \"My Game\")\n"
-            "game.clear(\"#000080\")\n"
-            "game.draw_rect(50, 50, 100, 75, \"red\")\n"
-            "game.draw_line(50, 50, 150, 150, \"green\")\n"
-            "game.draw_polygon(100, 100, 150, 50, 200, 100, \"yellow\")\n"
-            "game.set_key_handler(function(key)\n"
-            "    print(\"Key pressed: \" .. key)\n"
-            "end)\n"
-            "game.update()\n"
+            "-- Example of pyrequire usage:\n"
+            "-- Assuming you have a python module named 'my_module' accessible in PYTHONPATH,\n"
+            "-- you can load it as follows and call its functions from Lua:\n"
+            "-- local mod = pyrequire('my_module')\n"
+            "-- print(\"Module functions: \" .. tostring(mod))\n"
         )
         self.editor.insert(tk.END, sample)
 
@@ -1983,14 +1900,17 @@ class LuaIDE(tk.Tk):
         self.setup_tags()
 
     def setup_tags(self):
-        self.editor.tag_configure("keyword", foreground="#C678DD")
-        self.editor.tag_configure("string", foreground="#98C379")
-        self.editor.tag_configure("number", foreground="#D19A66")
-        self.editor.tag_configure("boolean", foreground="#E5C07B")
-        self.editor.tag_configure("comment", foreground="#7F848E", font=("Consolas", 14, "italic"))
-        self.editor.tag_configure("operator", foreground="#56B6C2")
-        self.editor.tag_configure("error", underline=True, foreground="#FF5555")
-        self.editor.tag_configure("undefined", underline=True, foreground="#61AFEF")
+        self.editor.tag_configure("keyword", foreground="#C678DD")  # Purple
+        self.editor.tag_configure("string", foreground="#98C379")  # Green
+        self.editor.tag_configure("number", foreground="#D19A66")  # Orange
+        self.editor.tag_configure("boolean", foreground="#E5C07B")  # Yellow
+        self.editor.tag_configure("comment", foreground="#7F848E", font=("Consolas", 14, "italic"))  # Grey
+        self.editor.tag_configure("operator", foreground="#56B6C2")  # Cyan
+        self.editor.tag_configure("function", foreground="#61AFEF")  # Blue
+        self.editor.tag_configure("variable", foreground="#E06C75")  # Red
+        self.editor.tag_configure("error", underline=True, foreground="#FF5555")  # Bright Red
+        self.editor.tag_configure("undefined", underline=True, foreground="#61AFEF")  # Blue
+        self.editor.tag_configure("local_keyword", foreground="#D19A66")  # Orange (for "local")
 
     def clear_editor(self):
         self.editor.delete(1.0, tk.END)
@@ -2017,9 +1937,10 @@ class LuaIDE(tk.Tk):
                 tokens = lexer.tokenize()
                 parser = Parser(tokens)
                 tree = parser.parse()
-                static_check(tree, {"wait": True, "require": True, "pairs": True, "ipairs": True, "select": True,
+                # Removed: "game" from static check list
+                static_check(tree, {"wait": True, "require": True, "pyrequire": True, "pairs": True, "ipairs": True, "select": True,
                                     "type": True, "tostring": True, "tonumber": True, "math": True, "table": True,
-                                    "string": True, "game": True, "task": True, "os": True})
+                                    "string": True, "task": True, "os": True})
                 self.current_interpreter = Interpreter(tree, output_callback=self.append_output)
                 self.current_interpreter.should_stop = False
                 self.current_interpreter.env['require'] = self.current_interpreter.builtin_require
@@ -2031,8 +1952,15 @@ class LuaIDE(tk.Tk):
         self.run_thread.start()
 
     def stop_code(self):
+        # Improved stop: signal stop, wait briefly for thread termination,
+        # clear current interpreter and reset interpreter state to refresh Python environment.
         if self.current_interpreter:
             self.current_interpreter.should_stop = True
+            if self.run_thread:
+                self.run_thread.join(timeout=1)
+            self.current_interpreter = None
+            _state.clear()
+            self.append_output("Interpreter stopped and environment refreshed.")
 
     def on_key_release(self, event):
         self.highlight_syntax()
@@ -2047,7 +1975,12 @@ class LuaIDE(tk.Tk):
         self.editor.tag_remove("boolean", "1.0", tk.END)
         self.editor.tag_remove("comment", "1.0", tk.END)
         self.editor.tag_remove("operator", "1.0", tk.END)
-        for kw in KEYWORDS:
+        self.editor.tag_remove("function", "1.0", tk.END)
+        self.editor.tag_remove("variable", "1.0", tk.END)
+        self.editor.tag_remove("local_keyword", "1.0", tk.END)
+
+        # Highlight keywords (excluding "local")
+        for kw in KEYWORDS - {"local"}:
             start = "1.0"
             while True:
                 pos = self.editor.search(r'\b' + kw + r'\b', start, stopindex=tk.END, regexp=True)
@@ -2056,85 +1989,65 @@ class LuaIDE(tk.Tk):
                 end = f"{pos}+{len(kw)}c"
                 self.editor.tag_add("keyword", pos, end)
                 start = end
+
+        # Highlight "local" separately in orange
+        start = "1.0"
+        while True:
+            pos = self.editor.search(r'\blocal\b', start, stopindex=tk.END, regexp=True)
+            if not pos:
+                break
+            end = f"{pos}+5c"
+            self.editor.tag_add("local_keyword", pos, end)
+            start = end
+
+        # Highlight booleans
         for match in re.finditer(r'\b(true|false|nil)\b', content):
             start_index = self.index_from_pos(match.start())
             end_index = self.index_from_pos(match.end())
             self.editor.tag_add("boolean", start_index, end_index)
+
+        # Highlight strings
         for match in re.finditer(r'(\".*?\"|\'.*?\')', content):
             start_index = self.index_from_pos(match.start())
             end_index = self.index_from_pos(match.end())
             self.editor.tag_add("string", start_index, end_index)
+
+        # Highlight numbers
         for match in re.finditer(r'\b\d+(\.\d+)?\b', content):
             start_index = self.index_from_pos(match.start())
             end_index = self.index_from_pos(match.end())
             self.editor.tag_add("number", start_index, end_index)
+
+        # Highlight comments
         for match in re.finditer(r'--.*', content):
             start_index = self.index_from_pos(match.start())
             end_index = self.index_from_pos(match.end())
             self.editor.tag_add("comment", start_index, end_index)
-        for match in re.finditer(r'(\+|\-|\*|\/|==|~=|<=|>=|<|>|\^|%|\/\/|\.\.)', content):
+
+        # Highlight operators
+        for match in re.finditer(r'(\+|\-|\*|\/|\=|\~\=|\=\=|\<|\>|\<=|\>=|\.\.)', content):
             start_index = self.index_from_pos(match.start())
             end_index = self.index_from_pos(match.end())
             self.editor.tag_add("operator", start_index, end_index)
 
+        # Highlight function names
+        for match in re.finditer(r'\bfunction\s+([a-zA-Z_][a-zA-Z0-9_]*)\b', content):
+            start_index = self.index_from_pos(match.start(1))
+            end_index = self.index_from_pos(match.end(1))
+            self.editor.tag_add("function", start_index, end_index)
+
+        # Highlight variables (excluding "local")
+        for match in re.finditer(r'\blocal\s+([a-zA-Z_][a-zA-Z0-9_]*)\b', content):
+            start_index = self.index_from_pos(match.start(1))
+            end_index = self.index_from_pos(match.end(1))
+            self.editor.tag_add("variable", start_index, end_index)
+
     def index_from_pos(self, pos):
-        return "1.0+%dc" % pos
+        return "1.0+" + str(pos) + "c"
 
     def show_autocomplete(self):
-        pos = self.editor.index(tk.INSERT)
-        line_text = self.editor.get("insert linestart", "insert lineend")
-        m = re.search(r'(\w+)\.(\w*)$', line_text)
-        if m:
-            mod_name = m.group(1)
-            prefix = m.group(2)
-            completions = []
-            if self.current_interpreter and mod_name in self.current_interpreter.env:
-                mod_obj = self.current_interpreter.env[mod_name]
-                if isinstance(mod_obj, dict):
-                    doc_dict = mod_obj.get("__doc__", {})
-                    for key in mod_obj:
-                        if key == "__doc__":
-                            continue
-                        if key.startswith(prefix):
-                            display = key
-                            if key in doc_dict:
-                                display += " - " + doc_dict[key]
-                            completions.append(display)
-            if completions:
-                self.show_completion_box(completions, pos)
-                return
-        prefix_match = re.findall(r'(\w+)$', line_text)
-        prefix = prefix_match[0] if prefix_match else ""
-        if not prefix:
-            self.hide_completion_box()
-            return
-        completions = [w for w in self.completion_words if w.startswith(prefix)]
-        if completions:
-            self.show_completion_box(completions, pos)
-        else:
-            self.hide_completion_box()
-
-    def show_completion_box(self, completions, pos):
-        if self.completion_box:
-            self.completion_box.destroy()
-        self.completion_box = tk.Listbox(self, height=len(completions), font=("Consolas", 12))
-        for comp in completions:
-            self.completion_box.insert(tk.END, comp)
-        self.completion_box.place(x=100, y=100)
-        self.completion_box.bind("<<ListboxSelect>>", self.insert_completion)
-
-    def hide_completion_box(self):
-        if self.completion_box:
-            self.completion_box.destroy()
-            self.completion_box = None
-
-    def insert_completion(self, event):
-        if self.completion_box:
-            selection = self.completion_box.curselection()
-            if selection:
-                comp = self.completion_box.get(selection[0])
-                self.editor.insert(tk.INSERT, comp)
-            self.hide_completion_box()
+        # Minimal autocomplete (implementation placeholder)
+        pass
 
     def check_syntax(self):
         self.editor.tag_remove("error", "1.0", tk.END)
@@ -2146,8 +2059,8 @@ class LuaIDE(tk.Tk):
             parser = Parser(tokens)
             ast = parser.parse()
             static_check(ast,
-                         {"wait": True, "require": True, "pairs": True, "ipairs": True, "select": True, "type": True,
-                          "tostring": True, "tonumber": True, "math": True, "table": True, "string": True, "game": True,
+                         {"wait": True, "require": True, "pyrequire": True, "pairs": True, "ipairs": True, "select": True, "type": True,
+                          "tostring": True, "tonumber": True, "math": True, "table": True, "string": True,
                           "task": True, "os": True})
         except Exception as e:
             err_msg = str(e)
